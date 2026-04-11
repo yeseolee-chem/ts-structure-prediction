@@ -13,8 +13,9 @@
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-# Set to "true" to load only 1/10th of each .db file (for quick experiments).
-DATA_LIMIT=${DATA_LIMIT:-"false"}
+# Number of samples to load from each .db file.
+# Set to 0 or leave unset to load the full dataset.
+DATA_LIMIT=${DATA_LIMIT:-100}
 
 # Root of the repository (adjust if submitting from a different directory).
 REPO_DIR=${REPO_DIR:-"$(pwd)"}
@@ -31,6 +32,7 @@ echo "Node        : $SLURMD_NODENAME"
 echo "GPUs        : $CUDA_VISIBLE_DEVICES"
 echo "DATA_LIMIT  : $DATA_LIMIT"
 echo "REPO_DIR    : $REPO_DIR"
+echo "CONDA_ENV   : $CONDA_ENV"
 echo "=========================================="
 
 mkdir -p "$REPO_DIR/logs"
@@ -48,15 +50,16 @@ python -c "import torch; print('PyTorch', torch.__version__, '|',
     torch.cuda.device_count(), 'GPU(s) available')"
 
 # ---------------------------------------------------------------------------
-# Patch data_limit flag at runtime if requested
+# Patch data_limit at runtime via environment variable
 # ---------------------------------------------------------------------------
+# train_halo8.py reads HALO8_DATA_LIMIT from env if set.
+# The Python script has data_limit=100 as default; patch here if needed.
 TRAIN_SCRIPT="$REPO_DIR/reactot/trainer/train_halo8.py"
 
-if [ "$DATA_LIMIT" = "true" ]; then
-    echo "INFO: Enabling data_limit=True (1/10 of each file will be loaded)."
-    # Create a temporary training script with data_limit patched.
+if [ "$DATA_LIMIT" != "0" ] && [ -n "$DATA_LIMIT" ]; then
+    echo "INFO: Patching data_limit to $DATA_LIMIT in training script."
     TMP_SCRIPT=$(mktemp /tmp/train_halo8_XXXX.py)
-    sed 's/data_limit=False/data_limit=True/' "$TRAIN_SCRIPT" > "$TMP_SCRIPT"
+    sed "s/data_limit=[0-9]*/data_limit=$DATA_LIMIT/" "$TRAIN_SCRIPT" > "$TMP_SCRIPT"
     TRAIN_SCRIPT="$TMP_SCRIPT"
 fi
 
