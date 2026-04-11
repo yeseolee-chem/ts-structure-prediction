@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:4
 #SBATCH --mem=128G
 #SBATCH --time=48:00:00
-#SBATCH --partition=gpu
+#SBATCH --partition=gpu4
 
 # ---------------------------------------------------------------------------
 # Configuration
