@@ -10,7 +10,7 @@ from pytorch_lightning import LightningModule
 from torchmetrics import MeanAbsoluteError, MeanAbsolutePercentageError, CosineSimilarity
 from sklearn.metrics.pairwise import cosine_similarity
 
-from reactot.dataset.ff_lmdb import LmdbDataset
+from reactot.dataset.ff_lmdb import LmdbDataset, HaloSQLiteDataset
 from reactot.dynamics import Potential
 from reactot.trainer._metrics import average_over_batch_metrics, pretty_print
 import reactot.utils.training_tools as utils
@@ -88,24 +88,73 @@ class PotentialModule(LightningModule):
         return optimizer
 
     def setup(self, stage: Optional[str] = None):
+        use_sqlite = self.training_config.get("use_sqlite", False)
+        data_limit = self.training_config.get("data_limit", False)
+
+        if use_sqlite:
+            # Halo8 SQLite dataset: the datadir is the folder with *.db files.
+            # A single directory is split into train/val by an 9:1 ratio at
+            # the file level (last file → validation, rest → training).
+            datadir = Path(self.training_config["datadir"])
+            db_files = sorted(datadir.glob("*.db"))
+            assert len(db_files) > 0, f"No .db files in {datadir}"
+
+            val_file = db_files[-1]
+            train_files = db_files[:-1]
+
+            # Write temporary symlink directories so HaloSQLiteDataset can
+            # glob *.db without modification.  Use plain sub-folders instead.
+            train_dir = datadir / "_split_train"
+            val_dir = datadir / "_split_val"
+            train_dir.mkdir(exist_ok=True)
+            val_dir.mkdir(exist_ok=True)
+
+            # Populate split dirs with symlinks (idempotent).
+            for f in train_files:
+                link = train_dir / f.name
+                if not link.exists():
+                    link.symlink_to(f.resolve())
+            val_link = val_dir / val_file.name
+            if not val_link.exists():
+                val_link.symlink_to(val_file.resolve())
+
+            if stage == "fit":
+                self.train_dataset = HaloSQLiteDataset(
+                    str(train_dir),
+                    data_limit=data_limit,
+                )
+                self.val_dataset = HaloSQLiteDataset(
+                    str(val_dir),
+                    data_limit=data_limit,
+                )
+            elif stage == "test":
+                self.test_dataset = HaloSQLiteDataset(
+                    str(val_dir),
+                    data_limit=data_limit,
+                )
+            else:
+                raise NotImplementedError
+        else:
+            if stage == "fit":
+                self.train_dataset = LmdbDataset(
+                    Path(self.training_config["datadir"], "ff_valid.lmdb"),
+                    **self.training_config,
+                )
+                self.val_dataset = LmdbDataset(
+                    Path(self.training_config["datadir"], "ff_valid.lmdb"),
+                    **self.training_config,
+                )
+            elif stage == "test":
+                self.test_dataset = LmdbDataset(
+                    Path(self.training_config["datadir"], "ff_test.lmdb"),
+                    **self.training_config,
+                )
+            else:
+                raise NotImplementedError
+
         if stage == "fit":
-            self.train_dataset = LmdbDataset(
-                Path(self.training_config["datadir"], f"ff_valid.lmdb"),
-                **self.training_config,
-            )
-            self.val_dataset = LmdbDataset(
-                Path(self.training_config["datadir"], f"ff_valid.lmdb"),
-                **self.training_config,
-            )
             print("# of training data: ", len(self.train_dataset))
             print("# of validation data: ", len(self.val_dataset))
-        elif stage == "test":
-            self.test_dataset = LmdbDataset(
-                Path(self.training_config["datadir"], f"ff_test.lmdb"),
-                **self.training_config,
-            )
-        else:
-            raise NotImplementedError
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(
