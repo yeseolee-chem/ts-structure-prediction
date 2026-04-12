@@ -1,5 +1,5 @@
 from typing import Dict, List, Optional, Tuple
-
+import random
 from pathlib import Path
 import torch
 from torch import nn
@@ -92,12 +92,22 @@ class PotentialModule(LightningModule):
         data_limit = self.training_config.get("data_limit", False)
 
         if use_sqlite:
-            # Halo8 SQLite dataset: the datadir is the folder with *.db files.
-            # A single directory is split into train/val by an 9:1 ratio at
-            # the file level (last file → validation, rest → training).
+            # Halo8 SQLite dataset: only files whose names start with 'Halo'
+            # are loaded.  The file list is shuffled so the train/val split is
+            # not always biased toward the same files across runs.  The last
+            # file after shuffling becomes the validation set.
             datadir = Path(self.training_config["datadir"])
-            db_files = sorted(datadir.glob("*.db"))
-            assert len(db_files) > 0, f"No .db files in {datadir}"
+            db_files = [
+                p for p in sorted(datadir.glob("*.db"))
+                if p.name.startswith("Halo")
+            ]
+            assert len(db_files) > 0, (
+                f"No .db files starting with 'Halo' found in {datadir}"
+            )
+
+            # Shuffle so val file is not always the same (use fixed seed for
+            # reproducibility when seed_everything has already been called).
+            random.shuffle(db_files)
 
             val_file = db_files[-1]
             train_files = db_files[:-1]

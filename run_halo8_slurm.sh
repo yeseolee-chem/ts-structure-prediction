@@ -36,6 +36,8 @@ echo "CONDA_ENV   : $CONDA_ENV"
 echo "=========================================="
 
 mkdir -p "$REPO_DIR/logs"
+mkdir -p "$REPO_DIR/checkpoint"
+mkdir -p "$REPO_DIR/results"
 cd "$REPO_DIR" || exit 1
 
 # Load modules (adjust to your cluster's module system).

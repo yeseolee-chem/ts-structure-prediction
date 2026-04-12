@@ -7,6 +7,7 @@ LICENSE file in the root directory of this source tree.
 
 import bisect
 import pickle
+import random
 import sqlite3
 from pathlib import Path
 
@@ -163,12 +164,19 @@ class HaloSQLiteDataset(Dataset):
         self.atom_mapping = atom_mapping if atom_mapping is not None else HALO_ATOM_MAPPING
         self.n_atom_types = len(self.atom_mapping)
 
-        db_paths = sorted(self.src.glob("*.db"))
-        assert len(db_paths) > 0, f"No .db files found in '{self.src}'"
+        # Only load files whose names start with 'Halo'.
+        all_db_paths = sorted(self.src.glob("*.db"))
+        db_paths = [p for p in all_db_paths if p.name.startswith("Halo")]
+        assert len(db_paths) > 0, (
+            f"No .db files starting with 'Halo' found in '{self.src}' "
+            f"(found {len(all_db_paths)} total .db files)"
+        )
         self._db_paths = db_paths
 
-        # For each file record how many rows are actually used.
-        self._counts = []
+        # For each file, randomly sample up to data_limit row IDs (1-based).
+        # Row IDs in ASE SQLite are sequential integers starting at 1.
+        self._row_ids: list = []   # list[list[int]] – one sub-list per file
+        self._counts: list = []
         for db_path in db_paths:
             conn = sqlite3.connect(str(db_path))
             cursor = conn.cursor()
@@ -176,18 +184,31 @@ class HaloSQLiteDataset(Dataset):
             total = cursor.fetchone()[0]
             conn.close()
 
-            effective = min(total, data_limit) if data_limit is not None else total
-            self._counts.append(effective)
+            all_ids = list(range(1, total + 1))   # 1-based SQLite row IDs
+            if data_limit is not None and data_limit < total:
+                sampled_ids = random.sample(all_ids, data_limit)
+            else:
+                sampled_ids = all_ids
+            # Keep the sampled IDs in a stable (sorted) order so that
+            # bisect-based indexing stays consistent across workers.
+            sampled_ids.sort()
+
+            self._row_ids.append(sampled_ids)
+            self._counts.append(len(sampled_ids))
             print(
                 f"  {db_path.name}: {total} rows"
-                + (f"  →  using first {effective}" if data_limit is not None else "")
+                + (
+                    f"  →  randomly sampled {len(sampled_ids)}"
+                    if data_limit is not None
+                    else ""
+                )
             )
 
         self._cumulative = np.cumsum(self._counts).tolist()
         self.num_samples = sum(self._counts)
         print(
             f"HaloSQLiteDataset: {self.num_samples} total samples "
-            f"from {len(db_paths)} file(s)"
+            f"from {len(db_paths)} Halo* file(s)"
             + (f" [data_limit={data_limit} per file]" if data_limit is not None else "")
         )
 
@@ -207,11 +228,11 @@ class HaloSQLiteDataset(Dataset):
         return self._conns[db_idx]
 
     def __getitem__(self, idx: int) -> Data:
-        # Locate which db file and which row within that file.
+        # Locate which db file and which position within that file's sample list.
         db_idx = bisect.bisect(self._cumulative, idx)
         el_idx = idx if db_idx == 0 else idx - self._cumulative[db_idx - 1]
-        # SQLite row ids are 1-based and sequential from 1.
-        row_id = el_idx + 1
+        # Use the pre-sampled, 1-based row ID for this position.
+        row_id = self._row_ids[db_idx][el_idx]
 
         conn = self._get_conn(db_idx)
         cursor = conn.cursor()
