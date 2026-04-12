@@ -6,10 +6,16 @@ LICENSE file in the root directory of this source tree.
 """
 
 import bisect
+import logging
 import pickle
 import random
+import re
 import sqlite3
 from pathlib import Path
+
+import ase.db
+
+logger = logging.getLogger(__name__)
 
 import lmdb
 import numpy as np
@@ -22,6 +28,10 @@ from torch_geometric.data import Batch, Data
 # Atom mapping for Halo8 dataset: H, C, N, O, F, S, Br
 HALO_ATOM_MAPPING = {1: 0, 6: 1, 7: 2, 8: 3, 9: 4, 16: 5, 35: 6}
 N_HALO_ATOM_TYPES = len(HALO_ATOM_MAPPING)
+
+# Compiled once at import time.  Strips the trailing conformer/frame index
+# from a dand_id string, e.g. "T1x_C2H2N2O_rxn00001_99" → "T1x_C2H2N2O_rxn00001".
+_RXN_SUFFIX_RE = re.compile(r"_\d+$")
 
 
 class LmdbDataset(Dataset):
@@ -138,8 +148,12 @@ class HaloSQLiteDataset(Dataset):
 
     Args:
         src (str): Path to directory containing ``*.db`` files.
-        data_limit (bool): If ``True``, load only the first 1/10th of
-            rows from each individual file. Defaults to ``False``.
+        data_limit (int, optional): If set, randomly sample up to this many
+            rows per **reaction group**.  Groups are formed by reading
+            ``dand_id`` from ``row.data`` and stripping the trailing
+            ``_<digits>`` conformer index (e.g. ``T1x_C2H2N2O_rxn00001_99``
+            → ``T1x_C2H2N2O_rxn00001``).  Defaults to ``None`` (load all
+            rows in every group).
         transform (callable, optional): Data transform applied after
             loading each sample. Defaults to ``None``.
         center (bool): Subtract the centroid from positions.
@@ -173,44 +187,53 @@ class HaloSQLiteDataset(Dataset):
         )
         self._db_paths = db_paths
 
-        # For each file, randomly sample up to data_limit row IDs (1-based).
-        # Row IDs in ASE SQLite are sequential integers starting at 1.
+        # For each file, group rows by base reaction ID (read from row.data),
+        # then randomly sample up to data_limit rows from each reaction group.
         self._row_ids: list = []   # list[list[int]] – one sub-list per file
         self._counts: list = []
         for db_path in db_paths:
-            conn = sqlite3.connect(str(db_path))
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM systems")
-            total = cursor.fetchone()[0]
-            conn.close()
+            adb = ase.db.connect(str(db_path))
+            total = adb.count()
 
-            all_ids = list(range(1, total + 1))   # 1-based SQLite row IDs
-            if data_limit is not None and data_limit < total:
-                sampled_ids = random.sample(all_ids, data_limit)
-            else:
-                sampled_ids = all_ids
-            # Keep the sampled IDs in a stable (sorted) order so that
-            # bisect-based indexing stays consistent across workers.
+            # Step 1 — group row IDs by base reaction ID.
+            # dand_id example : "T1x_C2H2N2O_rxn00001_99"
+            # base reaction ID: "T1x_C2H2N2O_rxn00001"  (strip trailing _<digits>)
+            reaction_groups: dict = {}
+            for row in adb:
+                dand_id = str((row.data or {}).get("dand_id", ""))
+                base_rxn = _RXN_SUFFIX_RE.sub("", dand_id) if dand_id else "__no_dand_id__"
+                reaction_groups.setdefault(base_rxn, []).append(row.id)
+
+            n_groups = len(reaction_groups)
+
+            # Step 2 — sample up to data_limit rows from each reaction group.
+            sampled_ids: list = []
+            for ids in reaction_groups.values():
+                if data_limit is not None and data_limit < len(ids):
+                    sampled_ids.extend(random.sample(ids, data_limit))
+                else:
+                    sampled_ids.extend(ids)
+
+            # Step 3 — sort for stable bisect-based indexing in __getitem__.
             sampled_ids.sort()
 
             self._row_ids.append(sampled_ids)
             self._counts.append(len(sampled_ids))
-            print(
-                f"  {db_path.name}: {total} rows"
-                + (
-                    f"  →  randomly sampled {len(sampled_ids)}"
-                    if data_limit is not None
-                    else ""
-                )
-            )
+
+            msg = f"{db_path.name}: {total} rows, {n_groups} reaction group(s)"
+            if data_limit is not None:
+                msg += f"  →  sampled {len(sampled_ids)} (≤{data_limit}/group)"
+            logger.info(msg)
 
         self._cumulative = np.cumsum(self._counts).tolist()
         self.num_samples = sum(self._counts)
-        print(
+        summary = (
             f"HaloSQLiteDataset: {self.num_samples} total samples "
             f"from {len(db_paths)} Halo* file(s)"
-            + (f" [data_limit={data_limit} per file]" if data_limit is not None else "")
         )
+        if data_limit is not None:
+            summary += f" [data_limit={data_limit} rows per reaction group]"
+        logger.info(summary)
 
         # Lazy per-process SQLite connection cache (populated in __getitem__).
         self._conns: dict = {}

@@ -9,6 +9,9 @@ node_nf per atom  = pos(3) + one_hot(7) + charge(1) = 11
 from typing import List, Optional, Tuple
 from uuid import uuid4
 import json
+import logging
+import os
+import sys
 from pathlib import Path
 
 import torch
@@ -25,6 +28,90 @@ from pytorch_lightning.strategies.ddp import DDPStrategy
 
 from reactot.trainer.ema import EMACallback
 from reactot.model import LEFTNet
+
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+def _setup_logging(results_dir: Path) -> logging.Logger:
+    """Attach file handlers to the root logger for this run.
+
+    Writes:
+      * ``results_dir/train.log``  — INFO and above (full execution log)
+      * ``results_dir/train.err``  — WARNING and above (errors / warnings)
+
+    A StreamHandler to stdout is also added so the same messages appear on
+    the console (and in the SLURM ``.out`` file).
+    """
+    fmt = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
+    formatter = logging.Formatter(fmt, datefmt)
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    # Console handler (INFO+) — mirrors to SLURM stdout capture.
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(formatter)
+    root.addHandler(sh)
+
+    # train.log — full INFO+ execution log.
+    fh = logging.FileHandler(results_dir / "train.log", mode="w", encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(formatter)
+    root.addHandler(fh)
+
+    # train.err — WARNING+ errors and exceptions only.
+    eh = logging.FileHandler(results_dir / "train.err", mode="w", encoding="utf-8")
+    eh.setLevel(logging.WARNING)
+    eh.setFormatter(formatter)
+    root.addHandler(eh)
+
+    return logging.getLogger(__name__)
+
+
+def _write_summary(results_dir: Path, run_name: str, config: dict,
+                   metrics_cb: "MetricsHistoryCallback") -> None:
+    """Write a human-readable ``summary.out`` with config and final metrics."""
+    import datetime
+    SEP = "=" * 70
+    lines = [
+        SEP,
+        f"RUN SUMMARY  —  {run_name}",
+        f"Completed    :  {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        SEP,
+        "",
+        "[Configuration]",
+    ]
+    for k, v in config.items():
+        lines.append(f"  {k:<30s} = {v}")
+
+    epochs = metrics_cb.epochs
+    history = metrics_cb.history
+
+    if epochs:
+        lines += ["", f"[Final metrics  (epoch {epochs[-1]})]"]
+        for k, vals in history.items():
+            v = vals[-1] if vals else float("nan")
+            lines.append(f"  {k:<30s} = {v:.6f}")
+
+        lines += ["", "[Best metrics]"]
+        for k, vals in history.items():
+            finite = [v for v in vals if v == v]   # drop NaN
+            if finite:
+                best = min(finite)
+                best_ep = epochs[vals.index(best)]
+                lines.append(f"  {k:<30s} = {best:.6f}  (epoch {best_ep})")
+
+    lines += ["", "[Output files]"]
+    for f in sorted(results_dir.iterdir()):
+        lines.append(f"  {f.name}")
+
+    out_path = results_dir / "summary.out"
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    logging.getLogger(__name__).info("Summary written to %s", out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -96,14 +183,43 @@ optimizer_config = dict(
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Runtime configuration — values are read from environment variables so the
+# sbatch script can override them without patching this file.
+#
+#   DATA_LIMIT    int | "0"   rows per .db file after dand_id filtering
+#                             (0 or unset → load all matching rows)
+#   HALO8_DATADIR str         absolute path to the Halo8/ database folder
+#   NUM_WORKERS   int         DataLoader workers per GPU process
+#   RESUME_FROM   str         path to a .ckpt file to resume training from
+# ---------------------------------------------------------------------------
+
+def _resolve_datadir() -> str:
+    """Return absolute path to the Halo8 dataset directory.
+
+    Priority: HALO8_DATADIR env var → sibling of this file's package root.
+    """
+    env = os.environ.get("HALO8_DATADIR", "").strip()
+    if env:
+        return env
+    # Derive from file location: reactot/trainer/ → reactot/dataset/Halo8
+    return str(Path(__file__).resolve().parent.parent / "dataset" / "Halo8")
+
+
+_data_limit_env = os.environ.get("DATA_LIMIT", "").strip()
+_data_limit: int | None = (
+    None if not _data_limit_env or _data_limit_env == "0"
+    else int(_data_limit_env)
+)
+
 training_config = dict(
     # ---- dataset ----
-    datadir="reactot/dataset/Halo8",   # folder that contains Halo_*.db files
-    use_sqlite=True,                    # use HaloSQLiteDataset instead of LmdbDataset
-    data_limit=100,                      # load first 100 samples from each .db file
+    datadir=_resolve_datadir(),
+    use_sqlite=True,                    # use HaloSQLiteDataset (not LmdbDataset)
+    data_limit=_data_limit,             # None = load all dand_id-filtered rows
     # ---- loader ----
     bz=32,
-    num_workers=4,
+    num_workers=int(os.environ.get("NUM_WORKERS", "4")),
     # ---- training ----
     clip_grad=True,
     gradient_clip_val=None,
@@ -144,6 +260,13 @@ seed_everything(42, workers=True)
 
 run_name = f"{model_type}-{version}-" + str(uuid4()).split("-")[-1]
 
+# Create the per-run results directory early so logging can write there.
+results_dir = Path("results") / run_name
+results_dir.mkdir(parents=True, exist_ok=True)
+log = _setup_logging(results_dir)
+log.info("Run name    : %s", run_name)
+log.info("Results dir : %s", results_dir.resolve())
+
 potential = PotentialModule(
     model_config=leftnet_config,
     optimizer_config=optimizer_config,
@@ -164,11 +287,22 @@ config = leftnet_config.copy()
 config.update(optimizer_config)
 config.update(training_config)
 
+# Checkpoint to resume from (RESUME_FROM env var, or None for a fresh run).
+resume_from: str | None = os.environ.get("RESUME_FROM") or None
+if resume_from:
+    log.info("Resuming from checkpoint: %s", resume_from)
+
+# WandB: respect WANDB_MODE env var (sbatch script sets it to 'offline' when
+# no WANDB_API_KEY is available; runs can be synced later with `wandb sync`).
+_wandb_offline = os.environ.get("WANDB_MODE", "online").lower() == "offline"
 wandb_logger = WandbLogger(
     project=project,
     log_model=False,
     name=run_name,
+    offline=_wandb_offline,
 )
+if _wandb_offline:
+    log.info("WandB running in offline mode (sync later with `wandb sync`)")
 try:
     wandb_logger.experiment.config.update(config)
 except Exception:
@@ -202,7 +336,7 @@ devices = list(range(torch.cuda.device_count())) or [0]
 if len(devices) > 1:
     strategy = DDPStrategy(find_unused_parameters=True)
 
-print("Config:", config)
+log.info("Config:\n%s", json.dumps(config, indent=2, default=str))
 trainer = Trainer(
     max_epochs=2000,
     accelerator="gpu",
@@ -214,16 +348,19 @@ trainer = Trainer(
     logger=wandb_logger,
     accumulate_grad_batches=1,
     gradient_clip_val=training_config["gradient_clip_val"],
-    replace_sampler_ddp=False,
 )
 
-trainer.fit(potential)
+log.info("Training started%s", f" (resuming from {resume_from})" if resume_from else "")
+try:
+    trainer.fit(potential, ckpt_path=resume_from)
+except Exception:
+    log.exception("Training failed with unhandled exception")
+    raise
+log.info("Training complete")
 
 # ---------------------------------------------------------------------------
 # Post-training: save metrics JSON + generate visualisation plots
 # ---------------------------------------------------------------------------
-results_dir = Path("results") / run_name
-results_dir.mkdir(parents=True, exist_ok=True)
 
 # --- 1. Save raw metrics history as JSON ---
 metrics_out = {"run_name": run_name, "epochs": metrics_history.epochs}
@@ -231,7 +368,7 @@ metrics_out.update(metrics_history.history)
 json_path = results_dir / "metrics_history.json"
 with open(json_path, "w") as _f:
     json.dump(metrics_out, _f, indent=2)
-print(f"Metrics JSON saved to {json_path}")
+log.info("Metrics JSON saved to %s", json_path)
 
 # --- 2. Generate plots (gracefully skip if matplotlib not available) ---
 try:
@@ -262,7 +399,7 @@ try:
     loss_path = results_dir / "loss_curves.png"
     fig.savefig(loss_path, dpi=150)
     plt.close(fig)
-    print(f"Loss-curve plot saved to {loss_path}")
+    log.info("Loss-curve plot saved to %s", loss_path)
 
     # --- MAE: energy & force ---
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
@@ -281,7 +418,7 @@ try:
     mae_path = results_dir / "mae_curves.png"
     fig.savefig(mae_path, dpi=150)
     plt.close(fig)
-    print(f"MAE-curve plot saved to {mae_path}")
+    log.info("MAE-curve plot saved to %s", mae_path)
 
     # --- Force cosine similarity (direction error) ---
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -294,7 +431,7 @@ try:
     cos_path = results_dir / "force_cosine_error.png"
     fig.savefig(cos_path, dpi=150)
     plt.close(fig)
-    print(f"Force-cosine plot saved to {cos_path}")
+    log.info("Force-cosine plot saved to %s", cos_path)
 
     # --- MAPE: energy & force ---
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
@@ -313,9 +450,11 @@ try:
     mape_path = results_dir / "mape_curves.png"
     fig.savefig(mape_path, dpi=150)
     plt.close(fig)
-    print(f"MAPE-curve plot saved to {mape_path}")
+    log.info("MAPE-curve plot saved to %s", mape_path)
 
-    print(f"\nAll result plots saved under: {results_dir}/")
+    log.info("All result plots saved under: %s/", results_dir)
 
 except ImportError:
-    print("matplotlib not found – skipping visualisation. Install with: pip install matplotlib")
+    log.warning("matplotlib not found – skipping visualisation. Install with: pip install matplotlib")
+
+_write_summary(results_dir, run_name, config, metrics_history)

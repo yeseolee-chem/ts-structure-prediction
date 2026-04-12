@@ -1,7 +1,10 @@
 from typing import Dict, List, Optional, Tuple
+import logging
 import random
 from pathlib import Path
 import torch
+
+logger = logging.getLogger(__name__)
 from torch import nn
 
 from torch_geometric.loader import DataLoader
@@ -89,14 +92,15 @@ class PotentialModule(LightningModule):
 
     def setup(self, stage: Optional[str] = None):
         use_sqlite = self.training_config.get("use_sqlite", False)
-        data_limit = self.training_config.get("data_limit", False)
+        data_limit = self.training_config.get("data_limit", None)
 
         if use_sqlite:
             # Halo8 SQLite dataset: only files whose names start with 'Halo'
             # are loaded.  The file list is shuffled so the train/val split is
             # not always biased toward the same files across runs.  The last
             # file after shuffling becomes the validation set.
-            datadir = Path(self.training_config["datadir"])
+            datadir = Path(self.training_config["datadir"]).resolve()
+            logger.info("HaloSQLiteDataset source dir: %s", datadir)
             db_files = [
                 p for p in sorted(datadir.glob("*.db"))
                 if p.name.startswith("Halo")
@@ -112,8 +116,7 @@ class PotentialModule(LightningModule):
             val_file = db_files[-1]
             train_files = db_files[:-1]
 
-            # Write temporary symlink directories so HaloSQLiteDataset can
-            # glob *.db without modification.  Use plain sub-folders instead.
+            # Write symlink directories so HaloSQLiteDataset can glob *.db.
             train_dir = datadir / "_split_train"
             val_dir = datadir / "_split_val"
             train_dir.mkdir(exist_ok=True)
@@ -128,6 +131,11 @@ class PotentialModule(LightningModule):
             if not val_link.exists():
                 val_link.symlink_to(val_file.resolve())
 
+            logger.info(
+                "Split: %d train file(s) + 1 val file (%s)",
+                len(train_files), val_file.name,
+            )
+
             if stage == "fit":
                 self.train_dataset = HaloSQLiteDataset(
                     str(train_dir),
@@ -137,13 +145,23 @@ class PotentialModule(LightningModule):
                     str(val_dir),
                     data_limit=data_limit,
                 )
+            elif stage == "validate":
+                # Validation-only run (e.g. trainer.validate()).
+                self.val_dataset = HaloSQLiteDataset(
+                    str(val_dir),
+                    data_limit=data_limit,
+                )
             elif stage == "test":
                 self.test_dataset = HaloSQLiteDataset(
                     str(val_dir),
                     data_limit=data_limit,
                 )
+            elif stage is None:
+                # Called during a sanity check before fit; datasets will be
+                # populated when setup("fit") is invoked.
+                pass
             else:
-                raise NotImplementedError
+                raise NotImplementedError(f"Unknown stage: {stage!r}")
         else:
             if stage == "fit":
                 self.train_dataset = LmdbDataset(
@@ -154,17 +172,19 @@ class PotentialModule(LightningModule):
                     Path(self.training_config["datadir"], "ff_valid.lmdb"),
                     **self.training_config,
                 )
+            elif stage in ("validate", None):
+                pass
             elif stage == "test":
                 self.test_dataset = LmdbDataset(
                     Path(self.training_config["datadir"], "ff_test.lmdb"),
                     **self.training_config,
                 )
             else:
-                raise NotImplementedError
+                raise NotImplementedError(f"Unknown stage: {stage!r}")
 
         if stage == "fit":
-            print("# of training data: ", len(self.train_dataset))
-            print("# of validation data: ", len(self.val_dataset))
+            logger.info("# of training data: %d", len(self.train_dataset))
+            logger.info("# of validation data: %d", len(self.val_dataset))
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(
@@ -281,5 +301,5 @@ class PotentialModule(LightningModule):
             self.gradnorm_queue.add(float(grad_norm))
 
         if float(grad_norm) > max_grad_norm:
-            print(f'Clipped gradient with value {grad_norm:.1f} '
-                  f'while allowed {max_grad_norm:.1f}')
+            logger.warning("Clipped gradient with value %.1f while allowed %.1f",
+                           grad_norm, max_grad_norm)

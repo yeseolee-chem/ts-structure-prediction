@@ -328,6 +328,7 @@ class EGNNDynamics(BaseDynamics):
             List[Tensor]: list of new edge attributes
         """
         ij_new_reverse = ij_new[torch.tensor([1, 0])]
+        ij_new_reverse = ij_new[torch.tensor([1, 0], device=ij_new.device)]
         ind_new_reverse = torch.where(
             (ij_new_reverse == edge_index_new_T).all(dim=1))[0]
         print(ind_new_reverse)

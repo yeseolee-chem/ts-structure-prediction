@@ -10,74 +10,143 @@
 #SBATCH --time=48:00:00
 #SBATCH --partition=gpu4
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-# Number of samples to load from each .db file.
-# Set to 0 or leave unset to load the full dataset.
-DATA_LIMIT=${DATA_LIMIT:-100}
+# ===========================================================================
+# Configurable parameters — override any at submission time:
+#   PARAM=value sbatch run_halo8_slurm.sh
+#
+# To change the partition:    sbatch --partition=<name> run_halo8_slurm.sh
+# To resume from checkpoint:  RESUME_FROM=/path/to/ckpt.ckpt sbatch ...
+# To use the full dataset:    DATA_LIMIT=0 sbatch ...
+# ===========================================================================
 
-# Root of the repository (adjust if submitting from a different directory).
-REPO_DIR=${REPO_DIR:-"$(pwd)"}
-
-# Conda environment name / path.
+# ---- Data / paths ----------------------------------------------------------
+DATA_LIMIT=${DATA_LIMIT:-100}      # rows per .db file; 0 = full dataset
+REPO_DIR=${REPO_DIR:-"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"}
 CONDA_ENV=${CONDA_ENV:-"reactot"}
+HALO8_DATADIR=${HALO8_DATADIR:-"$REPO_DIR/reactot/dataset/Halo8"}
 
-# ---------------------------------------------------------------------------
-# Environment setup
-# ---------------------------------------------------------------------------
+# ---- Resume from a specific checkpoint (empty = start fresh) ---------------
+RESUME_FROM=${RESUME_FROM:-""}
+
+# ---- HPC module names (set to empty string to skip loading) ----------------
+CUDA_MODULE=${CUDA_MODULE:-"cuda/11.8"}
+CUDNN_MODULE=${CUDNN_MODULE:-"cudnn/8.6"}
+CONDA_MODULE=${CONDA_MODULE:-"anaconda3"}
+
+# ===========================================================================
+# Pre-flight header
+# ===========================================================================
 echo "=========================================="
-echo "Job ID      : $SLURM_JOB_ID"
-echo "Node        : $SLURMD_NODENAME"
-echo "GPUs        : $CUDA_VISIBLE_DEVICES"
-echo "DATA_LIMIT  : $DATA_LIMIT"
-echo "REPO_DIR    : $REPO_DIR"
-echo "CONDA_ENV   : $CONDA_ENV"
+echo "Job ID         : ${SLURM_JOB_ID:-local}"
+echo "Node           : ${SLURMD_NODENAME:-$(hostname)}"
+echo "CUDA_VISIBLE   : ${CUDA_VISIBLE_DEVICES:-not set}"
+echo "DATA_LIMIT     : $DATA_LIMIT"
+echo "REPO_DIR       : $REPO_DIR"
+echo "CONDA_ENV      : $CONDA_ENV"
+echo "HALO8_DATADIR  : $HALO8_DATADIR"
+echo "RESUME_FROM    : ${RESUME_FROM:-<none>}"
 echo "=========================================="
 
-mkdir -p "$REPO_DIR/logs"
-mkdir -p "$REPO_DIR/checkpoint"
-mkdir -p "$REPO_DIR/results"
-cd "$REPO_DIR" || exit 1
+# ===========================================================================
+# Create output directories
+# ===========================================================================
+mkdir -p "$REPO_DIR/logs" "$REPO_DIR/checkpoint" "$REPO_DIR/results" \
+    || { echo "ERROR: Cannot create output directories under $REPO_DIR"; exit 1; }
 
-# Load modules (adjust to your cluster's module system).
-module purge
-module load cuda/11.8 cudnn/8.6 anaconda3
+cd "$REPO_DIR" || { echo "ERROR: Cannot cd to REPO_DIR=$REPO_DIR"; exit 1; }
 
-# Activate conda environment.
-source activate "$CONDA_ENV"
-
-# Verify GPU availability.
-python -c "import torch; print('PyTorch', torch.__version__, '|',
-    torch.cuda.device_count(), 'GPU(s) available')"
-
-# ---------------------------------------------------------------------------
-# Patch data_limit at runtime via environment variable
-# ---------------------------------------------------------------------------
-# train_halo8.py reads HALO8_DATA_LIMIT from env if set.
-# The Python script has data_limit=100 as default; patch here if needed.
-TRAIN_SCRIPT="$REPO_DIR/reactot/trainer/train_halo8.py"
-
-if [ "$DATA_LIMIT" != "0" ] && [ -n "$DATA_LIMIT" ]; then
-    echo "INFO: Patching data_limit to $DATA_LIMIT in training script."
-    TMP_SCRIPT=$(mktemp /tmp/train_halo8_XXXX.py)
-    sed "s/data_limit=[0-9]*/data_limit=$DATA_LIMIT/" "$TRAIN_SCRIPT" > "$TMP_SCRIPT"
-    TRAIN_SCRIPT="$TMP_SCRIPT"
+# ===========================================================================
+# Load HPC modules (skipped silently if 'module' is unavailable)
+# ===========================================================================
+if command -v module &>/dev/null; then
+    module purge
+    [ -n "$CUDA_MODULE" ]  && module load "$CUDA_MODULE"
+    [ -n "$CUDNN_MODULE" ] && module load "$CUDNN_MODULE"
+    [ -n "$CONDA_MODULE" ] && module load "$CONDA_MODULE"
+else
+    echo "INFO: 'module' command not found — skipping module load (using PATH as-is)"
 fi
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Activate conda environment
+# ===========================================================================
+# Use the proper shell hook so 'conda activate' works inside batch scripts.
+if conda_base=$(conda info --base 2>/dev/null); then
+    # shellcheck source=/dev/null
+    source "$conda_base/etc/profile.d/conda.sh"
+    conda activate "$CONDA_ENV" \
+        || { echo "ERROR: 'conda activate $CONDA_ENV' failed"; exit 1; }
+else
+    # Legacy fallback (older conda / cluster setups)
+    # shellcheck disable=SC1091
+    source activate "$CONDA_ENV" \
+        || { echo "ERROR: 'source activate $CONDA_ENV' failed"; exit 1; }
+fi
+
+echo "Python  : $(which python)"
+echo "Env     : $(conda info --name 2>/dev/null || echo $CONDA_ENV)"
+
+# ===========================================================================
+# Verify GPU availability
+# ===========================================================================
+GPU_COUNT=$(python -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo 0)
+echo "GPUs    : $GPU_COUNT available"
+if [ "$GPU_COUNT" -eq 0 ]; then
+    echo "ERROR: No CUDA GPUs detected. Verify CUDA installation and --gres directive."
+    exit 1
+fi
+
+# ===========================================================================
+# Verify data directory
+# ===========================================================================
+DB_COUNT=$(find "$HALO8_DATADIR" -maxdepth 1 -name "Halo*.db" 2>/dev/null | wc -l)
+if [ "$DB_COUNT" -eq 0 ]; then
+    echo "ERROR: No Halo*.db files found in $HALO8_DATADIR"
+    echo "       Set HALO8_DATADIR=<path> or place data under reactot/dataset/Halo8/"
+    exit 1
+fi
+echo "Data    : $HALO8_DATADIR ($DB_COUNT Halo*.db files)"
+
+# ===========================================================================
+# Derive optimal DataLoader num_workers from CPU / GPU allocation
+# Typically: workers_per_gpu = floor(cpus_per_task / num_gpus)
+# ===========================================================================
+CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-8}
+NUM_WORKERS=$(python -c "print(max(1, $CPUS_PER_TASK // max(1, $GPU_COUNT)))")
+echo "Workers : $NUM_WORKERS per GPU (CPUs=$CPUS_PER_TASK, GPUs=$GPU_COUNT)"
+
+# ===========================================================================
+# WandB: fall back to offline mode when no API key is available
+# (offline runs are synced later with `wandb sync`)
+# ===========================================================================
+if [ -z "$WANDB_API_KEY" ]; then
+    export WANDB_MODE=${WANDB_MODE:-offline}
+    echo "INFO: WANDB_API_KEY not set — WANDB_MODE=$WANDB_MODE"
+fi
+
+# ===========================================================================
+# Export all configuration to the training script via environment variables
+# ===========================================================================
+export DATA_LIMIT
+export HALO8_DATADIR
+export NUM_WORKERS
+export RESUME_FROM
+
+# ===========================================================================
 # Launch training
-# ---------------------------------------------------------------------------
+# ===========================================================================
+TRAIN_SCRIPT="$REPO_DIR/reactot/trainer/train_halo8.py"
+
+echo "=========================================="
 echo "Starting training at $(date)"
+echo "Script  : $TRAIN_SCRIPT"
+echo "=========================================="
 
 python -u "$TRAIN_SCRIPT"
 
 EXIT_CODE=$?
-echo "Training finished at $(date) with exit code $EXIT_CODE"
 
-# Clean up temporary script if created.
-if [ -n "$TMP_SCRIPT" ] && [ -f "$TMP_SCRIPT" ]; then
-    rm -f "$TMP_SCRIPT"
-fi
-
+echo "=========================================="
+echo "Training finished at $(date) — exit code $EXIT_CODE"
+echo "=========================================="
 exit $EXIT_CODE
