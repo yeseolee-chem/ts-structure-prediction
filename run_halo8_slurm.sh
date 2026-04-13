@@ -21,7 +21,7 @@
 
 # ---- Data / paths ----------------------------------------------------------
 DATA_LIMIT=${DATA_LIMIT:-100}      # reaction groups to sample; 0 = full dataset
-DATASET_PREFIX=${DATASET_PREFIX:-"Halogen"}   # "Halogen" or "T1x"
+DATASET_PREFIX=${DATASET_PREFIX:-"Halogen"}   # "Halogen", "T1x", or "Mix"
 REPO_DIR=${REPO_DIR:-"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"}
 CONDA_ENV=${CONDA_ENV:-"reactot"}
 HALO8_DATADIR=${HALO8_DATADIR:-"$REPO_DIR/reactot/dataset/Halo8"}

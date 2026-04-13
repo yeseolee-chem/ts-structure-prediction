@@ -216,7 +216,7 @@ training_config = dict(
     # ---- dataset ----
     datadir=_resolve_datadir(),
     use_sqlite=True,                    # use HaloSQLiteDataset (not LmdbDataset)
-    prefix=os.environ.get("DATASET_PREFIX", "Halogen"),  # "Halogen" or "T1x"
+    prefix=os.environ.get("DATASET_PREFIX", "Halogen"),  # "Halogen", "T1x", or "Mix"
     data_limit=_data_limit,             # None = load all dand_id-filtered rows
     # ---- loader ----
     bz=32,

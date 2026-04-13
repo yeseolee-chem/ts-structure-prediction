@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 from torch import nn
 
 from torch_geometric.loader import DataLoader
+from torch.utils.data import ConcatDataset
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, StepLR
 from pytorch_lightning import LightningModule
 from torchmetrics import MeanAbsoluteError, MeanAbsolutePercentageError, CosineSimilarity
@@ -137,30 +138,27 @@ class PotentialModule(LightningModule):
                 len(train_files), val_file.name,
             )
 
+            def _make_dataset(split_dir, p, lim):
+                """Build a single HaloSQLiteDataset or a ConcatDataset for Mix."""
+                if p == "Mix":
+                    mix_limit = 500
+                    hal = HaloSQLiteDataset(str(split_dir), prefix="Halogen", data_limit=mix_limit)
+                    t1x = HaloSQLiteDataset(str(split_dir), prefix="T1x",     data_limit=mix_limit)
+                    logger.info(
+                        "Mix: Halogen=%d + T1x=%d = %d samples from %s",
+                        len(hal), len(t1x), len(hal) + len(t1x), split_dir.name,
+                    )
+                    return ConcatDataset([hal, t1x])
+                return HaloSQLiteDataset(str(split_dir), prefix=p, data_limit=lim)
+
             if stage == "fit":
-                self.train_dataset = HaloSQLiteDataset(
-                    str(train_dir),
-                    prefix=prefix,
-                    data_limit=data_limit,
-                )
-                self.val_dataset = HaloSQLiteDataset(
-                    str(val_dir),
-                    prefix=prefix,
-                    data_limit=data_limit,
-                )
+                self.train_dataset = _make_dataset(train_dir, prefix, data_limit)
+                self.val_dataset   = _make_dataset(val_dir,   prefix, data_limit)
             elif stage == "validate":
                 # Validation-only run (e.g. trainer.validate()).
-                self.val_dataset = HaloSQLiteDataset(
-                    str(val_dir),
-                    prefix=prefix,
-                    data_limit=data_limit,
-                )
+                self.val_dataset = _make_dataset(val_dir, prefix, data_limit)
             elif stage == "test":
-                self.test_dataset = HaloSQLiteDataset(
-                    str(val_dir),
-                    prefix=prefix,
-                    data_limit=data_limit,
-                )
+                self.test_dataset = _make_dataset(val_dir, prefix, data_limit)
             elif stage is None:
                 # Called during a sanity check before fit; datasets will be
                 # populated when setup("fit") is invoked.
