@@ -6,14 +6,13 @@ LICENSE file in the root directory of this source tree.
 """
 
 import bisect
+import json as _json
 import logging
 import pickle
 import random
 import re
 import sqlite3
 from pathlib import Path
-
-import ase.db
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +28,12 @@ from torch_geometric.data import Batch, Data
 HALO_ATOM_MAPPING = {1: 0, 6: 1, 7: 2, 8: 3, 9: 4, 16: 5, 35: 6}
 N_HALO_ATOM_TYPES = len(HALO_ATOM_MAPPING)
 
-# Compiled once at import time.  Strips the trailing conformer/frame index
-# from a dand_id string, e.g. "T1x_C2H2N2O_rxn00001_99" → "T1x_C2H2N2O_rxn00001".
+# Compiled once at import time.
+# _RXN_SUFFIX_RE  – strips  the trailing conformer index, yielding the base reaction ID.
+# _CONF_IDX_RE    – captures the trailing conformer index as an integer.
+# e.g. "Halogen_C6FH7O_rxn18781_42" → base "Halogen_C6FH7O_rxn18781", conf_idx 42
 _RXN_SUFFIX_RE = re.compile(r"_\d+$")
+_CONF_IDX_RE   = re.compile(r"_(\d+)$")
 
 
 class LmdbDataset(Dataset):
@@ -130,6 +132,83 @@ class LmdbDataset(Dataset):
             self.env.close()
 
 
+def _index_halogen_groups(
+    db_path: Path,
+) -> tuple:
+    """Scan one file and return all Halogen-prefixed reaction groups.
+
+    Strategy
+    --------
+    1. **Index** – JOIN ``systems`` with ``species WHERE Z IN (9,17,35)``
+       to restrict to rows that contain F, Cl, or Br atoms.
+    2. **Filter** – locate the JSON payload in the data BLOB (skip the
+       8-byte binary header via ``blob.find(b'{')``), parse with
+       ``json.loads``, keep only rows where ``dand_id`` starts with
+       ``"Halogen"``.
+    3. **Group** – strip the trailing ``_<digits>`` conformer index from
+       ``dand_id`` (using :data:`_RXN_SUFFIX_RE`) to obtain the base
+       reaction ID, then group row IDs by that key.
+
+    No sampling is performed here; sampling happens globally in
+    :class:`HaloSQLiteDataset.__init__` after all files are scanned.
+
+    Returns
+    -------
+    tuple: ``(reaction_groups, total_rows, halogen_rows)``
+        * ``reaction_groups`` – ``dict[str, list[tuple]]`` mapping each base
+          reaction ID to a list of ``(row_id, conformer_idx, energy)`` triples
+          for every conformer of that reaction in this file
+        * ``total_rows``      – total rows in the file (for logging)
+        * ``halogen_rows``    – rows that passed the Halogen filter
+    """
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    cur = conn.cursor()
+
+    # Total row count (used only for the log message).
+    cur.execute("SELECT COUNT(*) FROM systems")
+    total_rows = cur.fetchone()[0]
+
+    # JOIN restricts to rows containing F (Z=9), Cl (Z=17), or Br (Z=35).
+    # The species table is indexed on Z, making this much faster than a
+    # full systems scan.  energy is fetched here so we can identify the TS
+    # (max-energy conformer) without a second query.
+    cur.execute("""
+        SELECT s.id, s.data, s.energy
+        FROM   systems s
+        INNER JOIN (
+            SELECT DISTINCT id FROM species WHERE Z IN (9, 17, 35)
+        ) h ON s.id = h.id
+    """)
+
+    reaction_groups: dict = {}
+    halogen_rows = 0
+
+    for row_id, blob, energy in cur:
+        if not blob:
+            continue
+        # Locate the JSON object — skip the 8-byte binary header prepended
+        # by ASE's encoder (find the first '{' byte).
+        start = blob.find(b"{")
+        if start == -1:
+            continue
+        try:
+            dand_id = _json.loads(blob[start:]).get("dand_id", "")
+        except Exception:
+            continue
+        if not str(dand_id).startswith("Halogen"):
+            continue
+        halogen_rows += 1
+        base_rxn = _RXN_SUFFIX_RE.sub("", dand_id)
+        m = _CONF_IDX_RE.search(dand_id)
+        conf_idx = int(m.group(1)) if m else 0
+        reaction_groups.setdefault(base_rxn, []).append(
+            (row_id, conf_idx, energy)
+        )
+
+    conn.close()
+    return reaction_groups, total_rows, halogen_rows
+
+
 class HaloSQLiteDataset(Dataset):
     r"""Dataset for loading ASE SQLite databases (Halo8 format).
 
@@ -148,12 +227,17 @@ class HaloSQLiteDataset(Dataset):
 
     Args:
         src (str): Path to directory containing ``*.db`` files.
-        data_limit (int, optional): If set, randomly sample up to this many
-            rows per **reaction group**.  Groups are formed by reading
-            ``dand_id`` from ``row.data`` and stripping the trailing
-            ``_<digits>`` conformer index (e.g. ``T1x_C2H2N2O_rxn00001_99``
-            → ``T1x_C2H2N2O_rxn00001``).  Defaults to ``None`` (load all
-            rows in every group).
+        data_limit (int, optional): If set, randomly sample exactly this
+            many **reaction groups** from the global pool of all
+            Halogen-prefixed groups found across all Halo_*.db files.
+            For each chosen group exactly **3 conformers** are kept:
+
+            * **R  (label 0)** – conformer with the lowest ``dand_id`` index
+            * **TS (label 1)** – conformer with the highest energy (saddle point)
+            * **P  (label 2)** – conformer with the highest ``dand_id`` index
+
+            All other intermediate conformers are discarded.
+            Defaults to ``None`` (keep all groups, 3 conformers each).
         transform (callable, optional): Data transform applied after
             loading each sample. Defaults to ``None``.
         center (bool): Subtract the centroid from positions.
@@ -187,52 +271,77 @@ class HaloSQLiteDataset(Dataset):
         )
         self._db_paths = db_paths
 
-        # For each file, group rows by base reaction ID (read from row.data),
-        # then randomly sample up to data_limit rows from each reaction group.
-        self._row_ids: list = []   # list[list[int]] – one sub-list per file
-        self._counts: list = []
-        for db_path in db_paths:
-            adb = ase.db.connect(str(db_path))
-            total = adb.count()
+        # Phase A: scan all files, build global reaction-group pool
+        # global_groups: base_rxn -> list of (db_idx, row_id, conf_idx, energy)
+        global_groups: dict = {}
 
-            # Step 1 — group row IDs by base reaction ID.
-            # dand_id example : "T1x_C2H2N2O_rxn00001_99"
-            # base reaction ID: "T1x_C2H2N2O_rxn00001"  (strip trailing _<digits>)
-            reaction_groups: dict = {}
-            for row in adb:
-                dand_id = str((row.data or {}).get("dand_id", ""))
-                base_rxn = _RXN_SUFFIX_RE.sub("", dand_id) if dand_id else "__no_dand_id__"
-                reaction_groups.setdefault(base_rxn, []).append(row.id)
+        for db_idx, db_path in enumerate(db_paths):
+            rxn_groups, total, halogen_rows = _index_halogen_groups(db_path)
 
-            n_groups = len(reaction_groups)
+            if halogen_rows == 0:
+                logger.warning(
+                    "%s: no Halogen-prefixed dand_id found among "
+                    "halogen-element rows (F/Cl/Br) - 0 samples from this file",
+                    db_path.name,
+                )
 
-            # Step 2 — sample up to data_limit rows from each reaction group.
-            sampled_ids: list = []
-            for ids in reaction_groups.values():
-                if data_limit is not None and data_limit < len(ids):
-                    sampled_ids.extend(random.sample(ids, data_limit))
-                else:
-                    sampled_ids.extend(ids)
+            for base_rxn, conformers in rxn_groups.items():
+                entries = global_groups.setdefault(base_rxn, [])
+                for row_id, conf_idx, energy in conformers:
+                    entries.append((db_idx, row_id, conf_idx, energy))
 
-            # Step 3 — sort for stable bisect-based indexing in __getitem__.
-            sampled_ids.sort()
+            logger.info(
+                "%s: %d rows, %d Halogen entries, %d reaction group(s)",
+                db_path.name, total, halogen_rows, len(rxn_groups),
+            )
 
-            self._row_ids.append(sampled_ids)
-            self._counts.append(len(sampled_ids))
+        # Phase B: sample reaction groups globally
+        all_rxn_keys = list(global_groups.keys())
+        n_total_groups = len(all_rxn_keys)
 
-            msg = f"{db_path.name}: {total} rows, {n_groups} reaction group(s)"
-            if data_limit is not None:
-                msg += f"  →  sampled {len(sampled_ids)} (≤{data_limit}/group)"
-            logger.info(msg)
+        if data_limit is not None and data_limit < n_total_groups:
+            chosen_keys = random.sample(all_rxn_keys, data_limit)
+            logger.info(
+                "Sampled %d reaction groups from %d total",
+                data_limit, n_total_groups,
+            )
+        else:
+            chosen_keys = all_rxn_keys
+            logger.info("Keeping all %d reaction groups", n_total_groups)
 
+        # Phase C: pick R / TS / P for each group, build per-file lists
+        # Each chosen group contributes exactly 3 (row_id, label) pairs:
+        #   R  (label 0) = conformer with minimum conf_idx  (reactant end)
+        #   TS (label 1) = conformer with maximum energy    (saddle point)
+        #   P  (label 2) = conformer with maximum conf_idx  (product end)
+        per_file_rows: list = [[] for _ in db_paths]
+
+        for base_rxn in chosen_keys:
+            entries = global_groups[base_rxn]
+            # entries: [(db_idx, row_id, conf_idx, energy), ...]
+            r_entry  = min(entries, key=lambda e: e[2])   # min conf_idx -> R
+            p_entry  = max(entries, key=lambda e: e[2])   # max conf_idx -> P
+            ts_entry = max(entries, key=lambda e: e[3])   # max energy   -> TS
+            for entry, label in ((r_entry, 0), (ts_entry, 1), (p_entry, 2)):
+                db_idx, row_id = entry[0], entry[1]
+                per_file_rows[db_idx].append((row_id, label))
+
+        # Sort by row_id; keep labels aligned.
+        sorted_pairs = [sorted(rows, key=lambda x: x[0]) for rows in per_file_rows]
+        self._row_ids = [[r for r, _ in pf] for pf in sorted_pairs]
+        self._labels  = [[l for _, l in pf] for pf in sorted_pairs]
+        self._counts  = [len(ids) for ids in self._row_ids]
+
+        # Phase D: summary
         self._cumulative = np.cumsum(self._counts).tolist()
         self.num_samples = sum(self._counts)
         summary = (
-            f"HaloSQLiteDataset: {self.num_samples} total samples "
-            f"from {len(db_paths)} Halo* file(s)"
+            f"HaloSQLiteDataset: {self.num_samples} total conformers "
+            f"(3 per group: R/TS/P) from {len(chosen_keys)} reaction group(s) "
+            f"across {len(db_paths)} Halo* file(s)"
         )
         if data_limit is not None:
-            summary += f" [data_limit={data_limit} rows per reaction group]"
+            summary += f" [data_limit={data_limit} groups]"
         logger.info(summary)
 
         # Lazy per-process SQLite connection cache (populated in __getitem__).
@@ -254,8 +363,9 @@ class HaloSQLiteDataset(Dataset):
         # Locate which db file and which position within that file's sample list.
         db_idx = bisect.bisect(self._cumulative, idx)
         el_idx = idx if db_idx == 0 else idx - self._cumulative[db_idx - 1]
-        # Use the pre-sampled, 1-based row ID for this position.
+        # Use the pre-sampled, 1-based row ID and its R/TS/P label.
         row_id = self._row_ids[db_idx][el_idx]
+        label  = self._labels[db_idx][el_idx]
 
         conn = self._get_conn(db_idx)
         cursor = conn.cursor()
@@ -295,6 +405,7 @@ class HaloSQLiteDataset(Dataset):
             ae=ae,
             forces=forces_t,
             natoms=torch.tensor([natoms], dtype=torch.long),
+            label=torch.tensor([label], dtype=torch.long),
         )
 
         if self.transform is not None:
