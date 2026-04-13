@@ -132,19 +132,23 @@ class LmdbDataset(Dataset):
             self.env.close()
 
 
-def _index_halogen_groups(
+def _index_rxn_groups(
     db_path: Path,
+    prefix: str = "Halogen",
 ) -> tuple:
-    """Scan one file and return all Halogen-prefixed reaction groups.
+    """Scan one file and return all reaction groups whose dand_id starts with
+    ``prefix``.
 
     Strategy
     --------
-    1. **Index** – JOIN ``systems`` with ``species WHERE Z IN (9,17,35)``
-       to restrict to rows that contain F, Cl, or Br atoms.
+    1. **Index** – For ``prefix="Halogen"``, JOIN ``systems`` with
+       ``species WHERE Z IN (9,17,35)`` to restrict to rows that contain
+       F, Cl, or Br atoms (fast path).  For any other prefix the full
+       ``systems`` table is scanned directly.
     2. **Filter** – locate the JSON payload in the data BLOB (skip the
        8-byte binary header via ``blob.find(b'{')``), parse with
        ``json.loads``, keep only rows where ``dand_id`` starts with
-       ``"Halogen"``.
+       ``prefix`` (case-sensitive).
     3. **Group** – strip the trailing ``_<digits>`` conformer index from
        ``dand_id`` (using :data:`_RXN_SUFFIX_RE`) to obtain the base
        reaction ID, then group row IDs by that key.
@@ -152,14 +156,22 @@ def _index_halogen_groups(
     No sampling is performed here; sampling happens globally in
     :class:`HaloSQLiteDataset.__init__` after all files are scanned.
 
+    Parameters
+    ----------
+    db_path : Path
+        Path to an ASE SQLite ``.db`` file.
+    prefix : str
+        ``dand_id`` prefix to keep.  Use ``"Halogen"`` (default) for the
+        Halo8 halogen dataset or ``"T1x"`` for the Transition1x dataset.
+
     Returns
     -------
-    tuple: ``(reaction_groups, total_rows, halogen_rows)``
+    tuple: ``(reaction_groups, total_rows, matched_rows)``
         * ``reaction_groups`` – ``dict[str, list[tuple]]`` mapping each base
           reaction ID to a list of ``(row_id, conformer_idx, energy)`` triples
           for every conformer of that reaction in this file
         * ``total_rows``      – total rows in the file (for logging)
-        * ``halogen_rows``    – rows that passed the Halogen filter
+        * ``matched_rows``    – rows that passed the prefix filter
     """
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     cur = conn.cursor()
@@ -168,20 +180,23 @@ def _index_halogen_groups(
     cur.execute("SELECT COUNT(*) FROM systems")
     total_rows = cur.fetchone()[0]
 
-    # JOIN restricts to rows containing F (Z=9), Cl (Z=17), or Br (Z=35).
-    # The species table is indexed on Z, making this much faster than a
-    # full systems scan.  energy is fetched here so we can identify the TS
-    # (max-energy conformer) without a second query.
-    cur.execute("""
-        SELECT s.id, s.data, s.energy
-        FROM   systems s
-        INNER JOIN (
-            SELECT DISTINCT id FROM species WHERE Z IN (9, 17, 35)
-        ) h ON s.id = h.id
-    """)
+    # For Halogen data, the species JOIN restricts to rows containing
+    # F (Z=9), Cl (Z=17), or Br (Z=35), which is much faster than a full
+    # systems scan (~1.3 M rows).  For other prefixes (e.g. T1x) all atom
+    # types are present, so we scan the full table.
+    if prefix == "Halogen":
+        cur.execute("""
+            SELECT s.id, s.data, s.energy
+            FROM   systems s
+            INNER JOIN (
+                SELECT DISTINCT id FROM species WHERE Z IN (9, 17, 35)
+            ) h ON s.id = h.id
+        """)
+    else:
+        cur.execute("SELECT id, data, energy FROM systems")
 
     reaction_groups: dict = {}
-    halogen_rows = 0
+    matched_rows = 0
 
     for row_id, blob, energy in cur:
         if not blob:
@@ -195,9 +210,9 @@ def _index_halogen_groups(
             dand_id = _json.loads(blob[start:]).get("dand_id", "")
         except Exception:
             continue
-        if not str(dand_id).startswith("Halogen"):
+        if not str(dand_id).startswith(prefix):
             continue
-        halogen_rows += 1
+        matched_rows += 1
         base_rxn = _RXN_SUFFIX_RE.sub("", dand_id)
         m = _CONF_IDX_RE.search(dand_id)
         conf_idx = int(m.group(1)) if m else 0
@@ -206,7 +221,7 @@ def _index_halogen_groups(
         )
 
     conn.close()
-    return reaction_groups, total_rows, halogen_rows
+    return reaction_groups, total_rows, matched_rows
 
 
 class HaloSQLiteDataset(Dataset):
@@ -249,6 +264,7 @@ class HaloSQLiteDataset(Dataset):
     def __init__(
         self,
         src: str,
+        prefix: str = "Halogen",
         data_limit: int = None,
         transform=None,
         center: bool = True,
@@ -257,6 +273,7 @@ class HaloSQLiteDataset(Dataset):
         super().__init__()
 
         self.src = Path(src)
+        self.prefix = prefix
         self.transform = transform
         self.center = center
         self.atom_mapping = atom_mapping if atom_mapping is not None else HALO_ATOM_MAPPING
@@ -276,13 +293,12 @@ class HaloSQLiteDataset(Dataset):
         global_groups: dict = {}
 
         for db_idx, db_path in enumerate(db_paths):
-            rxn_groups, total, halogen_rows = _index_halogen_groups(db_path)
+            rxn_groups, total, matched_rows = _index_rxn_groups(db_path, prefix)
 
-            if halogen_rows == 0:
+            if matched_rows == 0:
                 logger.warning(
-                    "%s: no Halogen-prefixed dand_id found among "
-                    "halogen-element rows (F/Cl/Br) - 0 samples from this file",
-                    db_path.name,
+                    "%s: no %s-prefixed dand_id found - 0 samples from this file",
+                    db_path.name, prefix,
                 )
 
             for base_rxn, conformers in rxn_groups.items():
@@ -291,8 +307,8 @@ class HaloSQLiteDataset(Dataset):
                     entries.append((db_idx, row_id, conf_idx, energy))
 
             logger.info(
-                "%s: %d rows, %d Halogen entries, %d reaction group(s)",
-                db_path.name, total, halogen_rows, len(rxn_groups),
+                "%s: %d rows, %d %s entries, %d reaction group(s)",
+                db_path.name, total, matched_rows, prefix, len(rxn_groups),
             )
 
         # Phase B: sample reaction groups globally

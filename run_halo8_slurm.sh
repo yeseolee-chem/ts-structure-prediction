@@ -20,7 +20,8 @@
 # ===========================================================================
 
 # ---- Data / paths ----------------------------------------------------------
-DATA_LIMIT=${DATA_LIMIT:-100}      # rows per .db file; 0 = full dataset
+DATA_LIMIT=${DATA_LIMIT:-100}      # reaction groups to sample; 0 = full dataset
+DATASET_PREFIX=${DATASET_PREFIX:-"Halogen"}   # "Halogen" or "T1x"
 REPO_DIR=${REPO_DIR:-"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"}
 CONDA_ENV=${CONDA_ENV:-"reactot"}
 HALO8_DATADIR=${HALO8_DATADIR:-"$REPO_DIR/reactot/dataset/Halo8"}
@@ -41,6 +42,7 @@ echo "Job ID         : ${SLURM_JOB_ID:-local}"
 echo "Node           : ${SLURMD_NODENAME:-$(hostname)}"
 echo "CUDA_VISIBLE   : ${CUDA_VISIBLE_DEVICES:-not set}"
 echo "DATA_LIMIT     : $DATA_LIMIT"
+echo "DATASET_PREFIX : $DATASET_PREFIX"
 echo "REPO_DIR       : $REPO_DIR"
 echo "CONDA_ENV      : $CONDA_ENV"
 echo "HALO8_DATADIR  : $HALO8_DATADIR"
@@ -128,6 +130,7 @@ fi
 # Export all configuration to the training script via environment variables
 # ===========================================================================
 export DATA_LIMIT
+export DATASET_PREFIX
 export HALO8_DATADIR
 export NUM_WORKERS
 export RESUME_FROM

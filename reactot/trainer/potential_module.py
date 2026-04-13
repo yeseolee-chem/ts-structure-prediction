@@ -93,6 +93,7 @@ class PotentialModule(LightningModule):
     def setup(self, stage: Optional[str] = None):
         use_sqlite = self.training_config.get("use_sqlite", False)
         data_limit = self.training_config.get("data_limit", None)
+        prefix     = self.training_config.get("prefix", "Halogen")
 
         if use_sqlite:
             # Halo8 SQLite dataset: only files whose names start with 'Halo'
@@ -139,21 +140,25 @@ class PotentialModule(LightningModule):
             if stage == "fit":
                 self.train_dataset = HaloSQLiteDataset(
                     str(train_dir),
+                    prefix=prefix,
                     data_limit=data_limit,
                 )
                 self.val_dataset = HaloSQLiteDataset(
                     str(val_dir),
+                    prefix=prefix,
                     data_limit=data_limit,
                 )
             elif stage == "validate":
                 # Validation-only run (e.g. trainer.validate()).
                 self.val_dataset = HaloSQLiteDataset(
                     str(val_dir),
+                    prefix=prefix,
                     data_limit=data_limit,
                 )
             elif stage == "test":
                 self.test_dataset = HaloSQLiteDataset(
                     str(val_dir),
+                    prefix=prefix,
                     data_limit=data_limit,
                 )
             elif stage is None:
