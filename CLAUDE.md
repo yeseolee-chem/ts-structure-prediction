@@ -6,7 +6,7 @@ This repository implements **React-OT**, an optimal transport flow matching (OT-
 
 **Primary reference**: Duan et al., "Accurate transition state generation with an object-aware equivariant elementary reaction diffusion model", *Nat. Mach. Intell.*, 2025, DOI: 10.1038/s42256-025-00988-1
 
-**Branch**: `t1x-and-halogen` — supports both Transition1x (C, H, N, O) and Halo8 (C, H, N, O, F, S, Br) datasets.
+**Branch**: `otfm-clean` (cleanup branch from `t1x-and-halogen`) — supports both Transition1x (C, H, N, O) and Halo8 (C, H, N, O, F, S, Br) datasets.
 
 **Cleanup status**: Legacy diffusion (DDPMModule, EnVariationalDiffusion), Confidence model, PotentialModule, QM9/Zeolite dataset references have been removed. Only OT-FM (SBModule + EnSB) remains.
 
@@ -213,11 +213,12 @@ ts-structure-prediction/
     │   ├── sampler.py         # Dynamic batch sampler
     │   └── transition1x.py    # T1x dataset
     ├── trainer/
+    │   ├── _metrics.py        # Logging helpers (average_over_batch_metrics, pretty_print)
     │   ├── pl_trainer.py      # ★ SBModule only (DDPMModule, ConfidenceModule removed)
     │   ├── train_rpsb_ts1x.py # Training script
     │   └── ema.py             # EMA callback
     ├── evaluate/
-    │   └── ...                # Evaluation scripts (RMSD, energy diff analysis)
+    │   └── (legacy .sh scripts only — Python eval scripts removed in cleanup)
     ├── analyze/
     │   └── rmsd.py            # batch_rmsd_sb, batch_rmsd (used by pl_trainer)
     └── utils/
