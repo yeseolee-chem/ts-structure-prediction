@@ -4,7 +4,7 @@ import os
 import shutil
 import torch
 
-from reactot.trainer.pl_trainer import SBModule, DDPMModule
+from reactot.trainer.pl_trainer import SBModule
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks.progress import TQDMProgressBar
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, LearningRateMonitor
@@ -150,26 +150,7 @@ run_name = f"{model_type}-{version}-" + str(uuid4()).split("-")[-1]
 # checkpoint_path=f"{tspath}/TSDiffusion-TS1x-All/RGD1xtb-pretrained-leftnet-0-7962cf1208dc/ddpm-epoch=1279-val-error_t_1=0.237.ckpt"
 # checkpoint_path = "/home/ubuntu/efs/reactot/reactot/trainer/checkpoint/TSDiff/leftnet-xtb-from-dftckpt-cd01d85c5152/ddpm-epoch=189-val-totloss=619.05.ckpt"
 # checkpoint_path = "/home/ubuntu/efs/reactot/reactot/trainer/checkpoint/RPSB-FT-Schedule/leftnet-xtb-c79fcfe0518d/sb-epoch=349-val_ep_scaled_err=0.0483.ckpt"
-checkpoint_path = None
-use_pretrain: bool = False
-
 source = None
-if use_pretrain:
-    ddpm_trainer = DDPMModule.load_from_checkpoint(
-        checkpoint_path=checkpoint_path,
-        map_location="cpu",
-    )
-    source = {
-        "model": ddpm_trainer.ddpm.dynamics.model.state_dict(),
-        "encoders": ddpm_trainer.ddpm.dynamics.encoders.state_dict(),
-        "decoders": ddpm_trainer.ddpm.dynamics.decoders.state_dict(),
-    }
-    training_config.update(
-        {
-            "checkpoint_path": checkpoint_path,
-            "use_pretrain": use_pretrain,
-        }
-    )
 
 seed_everything(42, workers=True)
 ddpm = SBModule(
