@@ -15,11 +15,10 @@ from pytorch_lightning import LightningModule
 from torchmetrics.classification import BinaryAccuracy, BinaryAUROC, BinaryF1Score, BinaryPrecision, BinaryCohenKappa
 from torchmetrics import PearsonCorrCoef, SpearmanCorrCoef, MeanAbsoluteError
 
-from reactot.dataset import ProcessedQM9, ProcessedDoubleQM9, ProcessedTripleQM9, ProcessedTS1x, DynamicBatchSampler, ProcessedZeolite
-from reactot.dynamics import EGNNDynamics, Confidence
+from reactot.dataset import ProcessedTS1x, DynamicBatchSampler
+from reactot.dynamics import EGNNDynamics
 from reactot.diffusion._schedule import DiffSchedule, PredefinedNoiseSchedule, SBSchedule
 from reactot.diffusion._normalizer import Normalizer, FEATURE_MAPPING
-from reactot.diffusion.en_diffusion import EnVariationalDiffusion
 from reactot.diffusion.en_sb import EnSB
 from reactot.trainer._metrics import average_over_batch_metrics, pretty_print
 import reactot.utils.training_tools as utils

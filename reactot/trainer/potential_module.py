@@ -15,7 +15,6 @@ from torchmetrics import MeanAbsoluteError, MeanAbsolutePercentageError, CosineS
 from sklearn.metrics.pairwise import cosine_similarity
 
 from reactot.dataset.ff_lmdb import LmdbDataset, HaloSQLiteDataset
-from reactot.dynamics import Potential
 from reactot.trainer._metrics import average_over_batch_metrics, pretty_print
 import reactot.utils.training_tools as utils
 
