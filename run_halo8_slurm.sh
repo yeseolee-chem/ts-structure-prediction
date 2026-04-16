@@ -29,10 +29,10 @@ HALO8_DATADIR=${HALO8_DATADIR:-"$REPO_DIR/reactot/dataset/Halo8"}
 # ---- Resume from a specific checkpoint (empty = start fresh) ---------------
 RESUME_FROM=${RESUME_FROM:-""}
 
-# ---- HPC module names (set to empty string to skip loading) ----------------
-CUDA_MODULE=${CUDA_MODULE:-"cuda/11.8"}
-CUDNN_MODULE=${CUDNN_MODULE:-"cudnn/8.6"}
-CONDA_MODULE=${CONDA_MODULE:-"anaconda3"}
+# ---- HPC module names — disabled: cluster does not use module load for CUDA/cuDNN/Conda ----
+# CUDA_MODULE=${CUDA_MODULE:-"cuda/11.8"}
+# CUDNN_MODULE=${CUDNN_MODULE:-"cudnn/8.6"}
+# CONDA_MODULE=${CONDA_MODULE:-"anaconda3"}
 
 # ===========================================================================
 # Pre-flight header
@@ -58,31 +58,22 @@ mkdir -p "$REPO_DIR/logs" "$REPO_DIR/checkpoint" "$REPO_DIR/results" \
 cd "$REPO_DIR" || { echo "ERROR: Cannot cd to REPO_DIR=$REPO_DIR"; exit 1; }
 
 # ===========================================================================
-# Load HPC modules (skipped silently if 'module' is unavailable)
+# HPC modules — skipped: cluster does not use module load for Conda/cuDNN
 # ===========================================================================
-if command -v module &>/dev/null; then
-    module purge
-    [ -n "$CUDA_MODULE" ]  && module load "$CUDA_MODULE"
-    [ -n "$CUDNN_MODULE" ] && module load "$CUDNN_MODULE"
-    [ -n "$CONDA_MODULE" ] && module load "$CONDA_MODULE"
-else
-    echo "INFO: 'module' command not found — skipping module load (using PATH as-is)"
-fi
+echo "INFO: module load disabled — relying on pre-activated environment and PATH"
 
 # ===========================================================================
 # Activate conda environment
 # ===========================================================================
-# Use the proper shell hook so 'conda activate' works inside batch scripts.
+# Source the conda shell hook so 'conda activate' works inside batch scripts.
 if conda_base=$(conda info --base 2>/dev/null); then
     # shellcheck source=/dev/null
     source "$conda_base/etc/profile.d/conda.sh"
     conda activate "$CONDA_ENV" \
         || { echo "ERROR: 'conda activate $CONDA_ENV' failed"; exit 1; }
 else
-    # Legacy fallback (older conda / cluster setups)
-    # shellcheck disable=SC1091
-    source activate "$CONDA_ENV" \
-        || { echo "ERROR: 'source activate $CONDA_ENV' failed"; exit 1; }
+    echo "ERROR: 'conda info --base' failed — conda not found in PATH"
+    exit 1
 fi
 
 echo "Python  : $(which python)"
@@ -138,7 +129,7 @@ export RESUME_FROM
 # ===========================================================================
 # Launch training
 # ===========================================================================
-TRAIN_SCRIPT="$REPO_DIR/reactot/trainer/train_halo8.py"
+TRAIN_SCRIPT="$REPO_DIR/reactot/trainer/train_rpsb_ts1x.py"
 
 echo "=========================================="
 echo "Starting training at $(date)"
