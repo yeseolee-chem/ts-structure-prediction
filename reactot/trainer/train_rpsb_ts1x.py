@@ -65,6 +65,13 @@ def parse_args(argv=None):
         action="store_true",
         help="Skip WandbLogger; log to CSV in logs/ instead.",
     )
+    p.add_argument(
+        "--halo-prefix",
+        choices=["Halogen", "T1x", "Mix"],
+        default=None,
+        help="Halo8 only: dand_id prefix filter. 'Mix' accepts both Halogen "
+        "and T1x. Falls back to the DATASET_PREFIX env var, then 'Halogen'.",
+    )
     args = p.parse_args(argv)
 
     if args.data_dir is None:
@@ -73,6 +80,8 @@ def parse_args(argv=None):
         args.data_limit = int(os.environ["DATA_LIMIT"])
     if args.num_workers is None and os.environ.get("NUM_WORKERS") is not None:
         args.num_workers = int(os.environ["NUM_WORKERS"])
+    if args.halo_prefix is None:
+        args.halo_prefix = os.environ.get("DATASET_PREFIX", "Halogen")
 
     return args
 
@@ -156,6 +165,7 @@ def build_configs(args):
     if args.dataset == "Halo8":
         training_config["data_limit"] = args.data_limit
         training_config["single_frag_only"] = False
+        training_config["prefix"] = args.halo_prefix
 
     # Smoke-test overrides
     if args.smoke_test:

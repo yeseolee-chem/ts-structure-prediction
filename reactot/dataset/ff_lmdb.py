@@ -132,9 +132,23 @@ class LmdbDataset(Dataset):
             self.env.close()
 
 
+def _normalize_prefix(prefix):
+    """Normalize a prefix argument to a tuple of prefix strings.
+
+    Accepts a single string, a tuple/list of strings, or the sentinel
+    ``"Mix"`` which expands to ``("Halogen", "T1x")``.  Case-insensitive
+    match for ``Mix``.
+    """
+    if isinstance(prefix, str):
+        if prefix.lower() == "mix":
+            return ("Halogen", "T1x")
+        return (prefix,)
+    return tuple(prefix)
+
+
 def _index_rxn_groups(
     db_path: Path,
-    prefix: str = "Halogen",
+    prefix="Halogen",
     max_groups: int = None,
 ) -> tuple:
     """Scan one file and return all reaction groups whose dand_id starts with
@@ -174,6 +188,7 @@ def _index_rxn_groups(
         * ``total_rows``      – total rows in the file (for logging)
         * ``matched_rows``    – rows that passed the prefix filter
     """
+    prefixes = _normalize_prefix(prefix)
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     cur = conn.cursor()
 
@@ -181,11 +196,11 @@ def _index_rxn_groups(
     cur.execute("SELECT COUNT(*) FROM systems")
     total_rows = cur.fetchone()[0]
 
-    # For Halogen data, the species JOIN restricts to rows containing
-    # F (Z=9), Cl (Z=17), or Br (Z=35), which is much faster than a full
-    # systems scan (~1.3 M rows).  For other prefixes (e.g. T1x) all atom
-    # types are present, so we scan the full table.
-    if prefix == "Halogen":
+    # Fast path only when the single requested prefix is 'Halogen':
+    # the species JOIN restricts to rows containing F (Z=9), Cl (Z=17),
+    # or Br (Z=35) – much faster than a full systems scan.  For any
+    # other prefix set (T1x, Mix, custom) we must scan the full table.
+    if prefixes == ("Halogen",):
         cur.execute("""
             SELECT s.id, s.data, s.energy
             FROM   systems s
@@ -211,7 +226,8 @@ def _index_rxn_groups(
             dand_id = _json.loads(blob[start:]).get("dand_id", "")
         except Exception:
             continue
-        if not str(dand_id).startswith(prefix):
+        dand_id_s = str(dand_id)
+        if not any(dand_id_s.startswith(p) for p in prefixes):
             continue
         matched_rows += 1
         base_rxn = _RXN_SUFFIX_RE.sub("", dand_id)
@@ -267,7 +283,7 @@ class HaloSQLiteDataset(Dataset):
     def __init__(
         self,
         src: str,
-        prefix: str = "Halogen",
+        prefix="Halogen",
         data_limit: int = None,
         transform=None,
         center: bool = True,
@@ -457,7 +473,7 @@ class ProcessedHalo8(Dataset):
         remove_h: bool = False,
         atom_mapping: dict = None,
         data_limit=None,
-        prefix: str = "Halogen",
+        prefix="Halogen",
         seed=None,
         max_db_files=None,
         **kwargs,
@@ -465,6 +481,9 @@ class ProcessedHalo8(Dataset):
         super().__init__()
         if atom_mapping is None:
             atom_mapping = HALO_ATOM_MAPPING
+        # Normalize string like "Mix" → tuple form once, so both the
+        # per-file scan path and any downstream logic see the same value.
+        prefix = _normalize_prefix(prefix)
 
         self.center = center
         self.device = device
