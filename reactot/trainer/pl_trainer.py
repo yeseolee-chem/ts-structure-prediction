@@ -14,7 +14,7 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, StepLR
 from pytorch_lightning import LightningModule
 from torchmetrics import PearsonCorrCoef, SpearmanCorrCoef, MeanAbsoluteError
 
-from reactot.dataset import ProcessedTS1x, DynamicBatchSampler
+from reactot.dataset import ProcessedTS1x, ProcessedHalo8, DynamicBatchSampler
 from reactot.dynamics import EGNNDynamics
 from reactot.diffusion._schedule import DiffSchedule, PredefinedNoiseSchedule, SBSchedule
 from reactot.diffusion._normalizer import Normalizer, FEATURE_MAPPING
@@ -28,9 +28,11 @@ from tqdm import tqdm
 
 PROCESS_FUNC = {
     "TS1x": ProcessedTS1x,
+    "Halo8": ProcessedHalo8,
 }
 FILE_TYPE = {
     "TS1x": ".pkl",
+    "Halo8": "",
 }
 LR_SCHEDULER = {
     "cos": CosineAnnealingWarmRestarts,
@@ -142,6 +144,9 @@ class SBModule(LightningModule):
         if self.clip_grad:
             self.gradnorm_queue = utils.Queue()
             self.gradnorm_queue.add(3000)
+        self._train_step_outputs: List = []
+        self._val_step_outputs: List = []
+        self._test_step_outputs: List = []
         self.save_hyperparameters()
 
 
@@ -163,10 +168,12 @@ class SBModule(LightningModule):
     def setup(
         self,
         stage: Optional[str] = None,
-        device: str = "cuda",
+        device: str = None,
         swapping_react_prod: Optional[bool] = None,
 
     ):
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         func = PROCESS_FUNC[self.process_type]
         ft = FILE_TYPE[self.process_type]
         if swapping_react_prod is not None:
@@ -174,36 +181,47 @@ class SBModule(LightningModule):
                 {"swapping_react_prod": swapping_react_prod}
             )
         self.training_config.update({"ts_guess": self.ts_guess})
+
+        def _data_path(split: str) -> Path:
+            """Return the path handed to the dataset constructor.
+
+            TS1x expects a concrete .pkl file (e.g. ``train_rpsb_all.pkl``).
+            Halo8 passes the raw directory and sub-samples via ``data_limit``.
+            """
+            if self.process_type == "Halo8":
+                return Path(self.training_config["datadir"])
+            return Path(
+                self.training_config["datadir"],
+                f"{split}_rpsb_all{ft}",
+            )
+
+        halo_base_seed = int(self.training_config.get("halo_seed", 42))
+
         if stage == "fit":
+            extra_train = {"seed": halo_base_seed} if self.process_type == "Halo8" else {}
             self.train_dataset = func(
-                Path(
-                    self.training_config["datadir"],
-                    f"train_rpsb_all{ft}",  # for transition1x
-                    # f"train_xtb{ft}",  # RGD1 and RGD1-xtb
-                ),
+                _data_path("train"),
                 # device=device,
                 **self.training_config,
+                **extra_train,
             )
             self.training_config["reflection"] = False  # Turn off reflection in val.
+            extra_val = (
+                {"seed": halo_base_seed + 1} if self.process_type == "Halo8" else {}
+            )
             self.val_dataset = func(
-                Path(
-                    self.training_config["datadir"],
-                    f"valid_rpsb_all{ft}",  # for transition1x
-                    # f"valid_xtb{ft}",  # RGD1 and RGD1-xtb
-                ),
+                _data_path("valid"),
                 # device=device,
                 **self.training_config,
+                **extra_val,
             )
 
             # self.training_config["swapping_react_prod"] = False  # uncomment if one does not want swapping in full validation
             val_dataset_no_swap = func(
-                Path(
-                    self.training_config["datadir"],
-                    f"valid_rpsb_all{ft}",  # for transition1x
-                    # f"valid_xtb{ft}",  # RGD1 and RGD1-xtb
-                ),
+                _data_path("valid"),
                 device=device,
                 **self.training_config,
+                **extra_val,
             )
             if self.training_config["use_sampler"]:
                 _config = self.training_config["sampler_config"].copy()
@@ -228,10 +246,18 @@ class SBModule(LightningModule):
                     collate_fn=val_dataset_no_swap.collate_fn,
                 )
         elif stage == "test":
+            if self.process_type == "Halo8":
+                test_path = Path(self.training_config["datadir"])
+            else:
+                test_path = Path(self.training_config["datadir"], f"test{ft}")
+            extra_test = (
+                {"seed": halo_base_seed + 2} if self.process_type == "Halo8" else {}
+            )
             self.test_dataset = func(
-                Path(self.training_config["datadir"], f"test{ft}"),
+                test_path,
                 # device=device,
                 **self.training_config,
+                **extra_test,
             )
         else:
             raise NotImplementedError
@@ -392,6 +418,7 @@ class SBModule(LightningModule):
         else:
             for k in self.eval_keys:
                 info[k] = np.nan
+        self._train_step_outputs.append(info)
         return info
 
     @torch.no_grad()
@@ -414,12 +441,17 @@ class SBModule(LightningModule):
         return ip
 
     def validation_step(self, batch, batch_idx, *args):
-        return self._shared_eval(batch, batch_idx, "val", *args)
+        info = self._shared_eval(batch, batch_idx, "val", *args)
+        self._val_step_outputs.append(info)
+        return info
 
     def test_step(self, batch, batch_idx, *args):
-        return self._shared_eval(batch, batch_idx, "test", *args)
+        info = self._shared_eval(batch, batch_idx, "test", *args)
+        self._test_step_outputs.append(info)
+        return info
 
-    def validation_epoch_end(self, val_step_outputs):
+    def on_validation_epoch_end(self) -> None:
+        val_step_outputs = self._val_step_outputs
         val_epoch_metrics = average_over_batch_metrics(val_step_outputs)
         if self.trainer.is_global_zero:
             pretty_print(self.current_epoch, val_epoch_metrics, prefix="val")
@@ -439,17 +471,20 @@ class SBModule(LightningModule):
             self.log("val_ep_rmsd_median", float(rmsds_median), sync_dist=True)
             self.log("val_ep_rmsd_std", float(rmsds_std), sync_dist=True)
 
-    def training_epoch_end(self, outputs) -> None:
+        self._val_step_outputs.clear()
+
+    def on_train_epoch_end(self) -> None:
+        outputs = self._train_step_outputs
         epoch_metrics = average_over_batch_metrics(outputs, allowed=self.eval_keys)
         for k, v in epoch_metrics.items():
             self.log(f"tr_{k}", v, sync_dist=True)
+        self._train_step_outputs.clear()
 
     def configure_gradient_clipping(
         self,
         optimizer,
-        optimizer_idx,
-        gradient_clip_val,
-        gradient_clip_algorithm
+        gradient_clip_val=None,
+        gradient_clip_algorithm=None,
     ):
 
         if not self.clip_grad:

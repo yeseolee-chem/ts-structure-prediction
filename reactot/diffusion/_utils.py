@@ -7,7 +7,10 @@ from torch_scatter import scatter_add, scatter_mean
 
 import ase
 from ase.calculators.emt import EMT
-from ase.neb import NEB
+try:
+    from ase.neb import NEB
+except ImportError:
+    from ase.mep import NEB
 from ase import Atoms
 
 

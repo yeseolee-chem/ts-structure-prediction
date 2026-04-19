@@ -136,7 +136,7 @@ echo "Starting training at $(date)"
 echo "Script  : $TRAIN_SCRIPT"
 echo "=========================================="
 
-python -u "$TRAIN_SCRIPT"
+python -u "$TRAIN_SCRIPT" --dataset Halo8
 
 EXIT_CODE=$?
 

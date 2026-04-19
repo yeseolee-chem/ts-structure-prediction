@@ -135,6 +135,7 @@ class LmdbDataset(Dataset):
 def _index_rxn_groups(
     db_path: Path,
     prefix: str = "Halogen",
+    max_groups: int = None,
 ) -> tuple:
     """Scan one file and return all reaction groups whose dand_id starts with
     ``prefix``.
@@ -219,6 +220,8 @@ def _index_rxn_groups(
         reaction_groups.setdefault(base_rxn, []).append(
             (row_id, conf_idx, energy)
         )
+        if max_groups is not None and len(reaction_groups) > max_groups:
+            break
 
     conn.close()
     return reaction_groups, total_rows, matched_rows
@@ -433,3 +436,191 @@ class HaloSQLiteDataset(Dataset):
         for conn in self._conns.values():
             conn.close()
         self._conns.clear()
+
+
+class ProcessedHalo8(Dataset):
+    """Halo8 adapter with BaseDataset-compatible interface.
+
+    Loads R/TS/P conformer triples from ASE SQLite .db files and exposes them
+    in the same dict layout (``pos_0/1/2``, ``one_hot_0/1/2``, ``charge_0/1/2``,
+    ``size_0/1/2``, ``mask_0/1/2``) that ``reactot.dataset.base_dataset.BaseDataset``
+    uses, so the existing ``collate_fn`` and the OT-FM training pipeline work
+    without modification.
+    """
+
+    def __init__(
+        self,
+        npz_path,
+        center: bool = True,
+        device: str = "cpu",
+        zero_charge: bool = False,
+        remove_h: bool = False,
+        atom_mapping: dict = None,
+        data_limit=None,
+        prefix: str = "Halogen",
+        seed=None,
+        max_db_files=None,
+        **kwargs,
+    ):
+        super().__init__()
+        if atom_mapping is None:
+            atom_mapping = HALO_ATOM_MAPPING
+
+        self.center = center
+        self.device = device
+        self.zero_charge = zero_charge
+        self.remove_h = remove_h
+        self.atom_mapping = atom_mapping
+        self.n_element = len(atom_mapping)
+        self.n_fragment = 3
+        self.data = {}
+
+        if data_limit is not None:
+            data_limit = int(data_limit)
+            if data_limit <= 0:
+                data_limit = None
+
+        src = Path(npz_path)
+        all_db_paths = sorted(src.glob("*.db"))
+        db_paths = [p for p in all_db_paths if p.name.startswith("Halo")]
+        assert len(db_paths) > 0, (
+            f"No .db files starting with 'Halo' found in '{src}' "
+            f"(found {len(all_db_paths)} total .db files)"
+        )
+        if max_db_files is not None and max_db_files > 0:
+            db_paths = db_paths[: int(max_db_files)]
+
+        global_groups: dict = {}
+        per_file_cap = None
+        if data_limit is not None:
+            per_file_cap = data_limit * 3
+        for db_idx, db_path in enumerate(db_paths):
+            rxn_groups, _total, _matched = _index_rxn_groups(
+                db_path, prefix, max_groups=per_file_cap
+            )
+            for base_rxn, conformers in rxn_groups.items():
+                entries = global_groups.setdefault(base_rxn, [])
+                for row_id, conf_idx, energy in conformers:
+                    entries.append((db_idx, row_id, conf_idx, energy))
+            # Early termination for small data_limit: stop scanning further
+            # files once we already have enough reaction groups. This is a
+            # smoke-test fast-path; full SLURM runs set data_limit=None.
+            if data_limit is not None and len(global_groups) >= data_limit * 3:
+                break
+
+        all_rxn_keys = sorted(global_groups.keys())
+        if seed is not None:
+            rng = random.Random(seed)
+        else:
+            rng = random
+        if data_limit is not None and data_limit < len(all_rxn_keys):
+            chosen_keys = rng.sample(all_rxn_keys, data_limit)
+        else:
+            chosen_keys = all_rxn_keys
+
+        groups_per_frag: dict = {0: [], 1: [], 2: []}
+        conn_cache: dict = {}
+
+        def _get_conn(db_idx: int) -> sqlite3.Connection:
+            if db_idx not in conn_cache:
+                conn_cache[db_idx] = sqlite3.connect(
+                    str(db_paths[db_idx]), check_same_thread=False
+                )
+            return conn_cache[db_idx]
+
+        for base_rxn in chosen_keys:
+            entries = global_groups[base_rxn]
+            r_entry = min(entries, key=lambda e: e[2])
+            p_entry = max(entries, key=lambda e: e[2])
+            ts_entry = max(entries, key=lambda e: e[3])
+            for entry, frag_idx in ((r_entry, 0), (ts_entry, 1), (p_entry, 2)):
+                db_idx, row_id = entry[0], entry[1]
+                conn = _get_conn(db_idx)
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT numbers, positions, natoms FROM systems WHERE id = ?",
+                    (row_id,),
+                )
+                row = cur.fetchone()
+                assert row is not None, (
+                    f"Row id={row_id} not found in {db_paths[db_idx]}"
+                )
+                numbers_blob, pos_blob, natoms = row
+                numbers = np.frombuffer(numbers_blob, dtype=np.int32).copy()
+                positions = (
+                    np.frombuffer(pos_blob, dtype=np.float64)
+                    .reshape(natoms, 3)
+                    .copy()
+                )
+                groups_per_frag[frag_idx].append(
+                    {"numbers": numbers, "positions": positions, "natoms": int(natoms)}
+                )
+
+        for conn in conn_cache.values():
+            conn.close()
+
+        self.n_samples = len(chosen_keys)
+
+        for frag_idx in (0, 1, 2):
+            entries = groups_per_frag[frag_idx]
+            self.data[f"size_{frag_idx}"] = torch.tensor(
+                [d["natoms"] for d in entries], device=self.device
+            )
+            pos_list = [
+                torch.tensor(d["positions"], device=self.device, dtype=torch.float32)
+                for d in entries
+            ]
+            if self.center:
+                pos_list = [p - torch.mean(p, dim=0) for p in pos_list]
+            self.data[f"pos_{frag_idx}"] = pos_list
+
+            atom_idx_list = [
+                torch.tensor(
+                    [self.atom_mapping[int(z)] for z in d["numbers"]],
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                for d in entries
+            ]
+            self.data[f"one_hot_{frag_idx}"] = [
+                F.one_hot(_z, num_classes=self.n_element) for _z in atom_idx_list
+            ]
+
+            if self.zero_charge:
+                self.data[f"charge_{frag_idx}"] = [
+                    torch.zeros(
+                        size=(d["natoms"], 1), dtype=torch.int64, device=self.device
+                    )
+                    for d in entries
+                ]
+            else:
+                self.data[f"charge_{frag_idx}"] = [
+                    torch.tensor(
+                        d["numbers"], device=self.device, dtype=torch.int64
+                    ).view(-1, 1)
+                    for d in entries
+                ]
+
+            self.data[f"mask_{frag_idx}"] = [
+                torch.zeros(
+                    size=(d["natoms"],), dtype=torch.int64, device=self.device
+                )
+                for d in entries
+            ]
+
+        self.data["condition"] = [
+            torch.zeros(size=(1, 1), dtype=torch.int64, device=self.device)
+            for _ in range(self.n_samples)
+        ]
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        return {key: val[idx] for key, val in self.data.items()}
+
+    @staticmethod
+    def collate_fn(batch):
+        from reactot.dataset.base_dataset import BaseDataset
+
+        return BaseDataset.collate_fn(batch)
