@@ -165,15 +165,21 @@ export RESUME_FROM
 
 # ===========================================================================
 # Launch training
+# ---------------------------------------------------------------------------
+# Run as a module (-m) so that $REPO_DIR (the CWD) is prepended to sys.path
+# and `import reactot` resolves without requiring `pip install -e .`.
+# PYTHONPATH is also exported as a belt-and-suspenders fallback when users
+# launch this script from a different working directory.
 # ===========================================================================
-TRAIN_SCRIPT="$REPO_DIR/reactot/trainer/train_rpsb_ts1x.py"
+export PYTHONPATH="$REPO_DIR:${PYTHONPATH:-}"
 
 echo "=========================================="
 echo "Starting training at $(date)"
-echo "Script  : $TRAIN_SCRIPT"
+echo "Module  : reactot.trainer.train_rpsb_ts1x"
+echo "PYTHONPATH : $PYTHONPATH"
 echo "=========================================="
 
-python -u "$TRAIN_SCRIPT" --dataset Halo8
+python -u -m reactot.trainer.train_rpsb_ts1x --dataset Halo8
 
 EXIT_CODE=$?
 
