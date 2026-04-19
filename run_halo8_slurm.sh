@@ -1,20 +1,28 @@
 #!/bin/bash
+# ===========================================================================
+# UBAI cpu-gpu-cluster — gpu6 (A10) partition
+# Reference: UBAI 서버사용법.pptx slide 21 (SBATCH template)
+#            cpu-gpu-cluster 접속 가이드 v2.0.2.pdf
+# Partition→GPU map (pptx slide 27):
+#   gpu1/gpu3 → RTX3090   gpu4/gpu5 → A6000   gpu6 → A10   cpu → no GRES
+# ===========================================================================
 #SBATCH --job-name=halo8-ff
 #SBATCH --output=logs/halo8_%j.out
 #SBATCH --error=logs/halo8_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:4
-#SBATCH --mem=128G
+#SBATCH --cpus-per-task=14
+#SBATCH --partition=gpu6
+#SBATCH --gres=gpu:a10:1
+#SBATCH --mem=64G
 #SBATCH --time=48:00:00
-#SBATCH --partition=gpu4
 
 # ===========================================================================
 # Configurable parameters — override any at submission time:
 #   PARAM=value sbatch run_halo8_slurm.sh
 #
 # To change the partition:    sbatch --partition=<name> run_halo8_slurm.sh
+# To request more A10 GPUs:   sbatch --gres=gpu:a10:2 run_halo8_slurm.sh
 # To resume from checkpoint:  RESUME_FROM=/path/to/ckpt.ckpt sbatch ...
 # To use the full dataset:    DATA_LIMIT=0 sbatch ...
 # ===========================================================================
