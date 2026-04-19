@@ -32,6 +32,12 @@ DATA_LIMIT=${DATA_LIMIT:-100}      # reaction groups to sample; 0 = full dataset
 DATASET_PREFIX=${DATASET_PREFIX:-"Halogen"}   # "Halogen", "T1x", or "Mix"
 REPO_DIR=${REPO_DIR:-"${SLURM_SUBMIT_DIR:-$(pwd)}"}
 CONDA_ENV=${CONDA_ENV:-"reactot"}
+
+# Canonical data location on UBAI: ~/projects/ts_prediction_project/data
+# The trainer's default path is <repo>/reactot/dataset/Halo8 — we symlink the
+# canonical directory into that location (auto-created below) so both the
+# trainer and this script agree without hard-coded absolute paths.
+HALO8_SOURCE=${HALO8_SOURCE:-"$HOME/projects/ts_prediction_project/data"}
 HALO8_DATADIR=${HALO8_DATADIR:-"$REPO_DIR/reactot/dataset/Halo8"}
 
 # ---- Resume from a specific checkpoint (empty = start fresh) ---------------
@@ -53,6 +59,7 @@ echo "DATA_LIMIT     : $DATA_LIMIT"
 echo "DATASET_PREFIX : $DATASET_PREFIX"
 echo "REPO_DIR       : $REPO_DIR"
 echo "CONDA_ENV      : $CONDA_ENV"
+echo "HALO8_SOURCE   : $HALO8_SOURCE"
 echo "HALO8_DATADIR  : $HALO8_DATADIR"
 echo "RESUME_FROM    : ${RESUME_FROM:-<none>}"
 echo "=========================================="
@@ -99,10 +106,32 @@ fi
 
 # ===========================================================================
 # Verify data directory
+# ---------------------------------------------------------------------------
+# If HALO8_DATADIR is missing / broken and HALO8_SOURCE is a real directory,
+# create the symlink automatically so the trainer's default relative path
+# (reactot/dataset/Halo8) resolves to the canonical data location.
+# Equivalent to the manual setup:
+#   rm -rf <repo>/reactot/dataset/Halo8
+#   ln -s $HOME/projects/ts_prediction_project/data <repo>/reactot/dataset/Halo8
 # ===========================================================================
-DB_COUNT=$(find "$HALO8_DATADIR" -maxdepth 1 -name "Halo*.db" 2>/dev/null | wc -l)
+if [ ! -e "$HALO8_DATADIR" ]; then
+    if [ -d "$HALO8_SOURCE" ]; then
+        echo "INFO: Linking $HALO8_DATADIR -> $HALO8_SOURCE"
+        mkdir -p "$(dirname "$HALO8_DATADIR")"
+        ln -sfn "$HALO8_SOURCE" "$HALO8_DATADIR" \
+            || { echo "ERROR: Failed to create symlink $HALO8_DATADIR -> $HALO8_SOURCE"; exit 1; }
+    else
+        echo "ERROR: Neither $HALO8_DATADIR nor $HALO8_SOURCE exists."
+        echo "       Place data under ~/projects/ts_prediction_project/data or"
+        echo "       override HALO8_SOURCE / HALO8_DATADIR at submission time."
+        exit 1
+    fi
+fi
+
+DB_COUNT=$(find -L "$HALO8_DATADIR" -maxdepth 1 -name "Halo*.db" 2>/dev/null | wc -l)
 if [ "$DB_COUNT" -eq 0 ]; then
     echo "ERROR: No Halo*.db files found in $HALO8_DATADIR"
+    echo "       Resolved via symlink? $(readlink -f "$HALO8_DATADIR" 2>/dev/null || echo "n/a")"
     echo "       Set HALO8_DATADIR=<path> or place data under reactot/dataset/Halo8/"
     exit 1
 fi
