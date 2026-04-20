@@ -12,6 +12,27 @@
 # ===========================================================================
 set -e
 
+# ===========================================================================
+# Guard: must be run inside the 'reactot' conda env (Python 3.10)
+# ===========================================================================
+CURRENT_ENV="${CONDA_DEFAULT_ENV:-base}"
+PYTHON_VERSION=$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+
+if [ "$CURRENT_ENV" != "reactot" ]; then
+    echo "ERROR: Please activate the reactot conda env first:"
+    echo "       conda activate reactot"
+    echo "       bash install_ubai.sh"
+    exit 1
+fi
+
+if [ "$PYTHON_VERSION" != "3.10" ]; then
+    echo "ERROR: Expected Python 3.10, got $PYTHON_VERSION"
+    echo "       Make sure you're in the reactot env: conda activate reactot"
+    exit 1
+fi
+
+echo "ENV     : $CURRENT_ENV (Python $PYTHON_VERSION) — OK"
+
 echo "=========================================="
 echo "Step 1/7  numpy<2 (torch 2.2.1 ABI)"
 echo "=========================================="
