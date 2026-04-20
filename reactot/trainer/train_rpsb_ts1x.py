@@ -305,7 +305,15 @@ def main(argv=None):
     callbacks = [
         EarlyStopping(
             monitor="val_ep_scaled_err",
-            patience=2000,
+            # patience=30 chosen for DATA_LIMIT=1000 smoke/test runs:
+            #   * val is drawn from 20 batches → noisy RMSD, needs buffer
+            #   * EMA (decay=0.999) stabilizes slowly → 15-40 epoch plateaus
+            #     are common before the loss drops again
+            #   * min_delta=1e-4 filters out sub-noise "improvements" so the
+            #     counter only advances on genuine plateaus.
+            # For a full-dataset production run bump patience to ~100.
+            patience=30,
+            min_delta=1e-4,
             verbose=True,
             log_rank_zero_only=True,
             # PL 2.x runs EarlyStopping at both train- and val-epoch-end by
