@@ -127,8 +127,8 @@ def build_configs(args):
         process_type = "TS1x"
     else:  # Halo8
         default_datadir = args.data_dir or "reactot/dataset/Halo8"
-        # Halo8: 3 (pos) + 7 (one_hot) + 1 (charge) = 11
-        node_nfs: List[int] = [11] * 3
+        # Halo8: 3 (pos) + 8 (one_hot: H/C/N/O/F/S/Cl/Br) + 1 (charge) = 12
+        node_nfs: List[int] = [12] * 3
         process_type = "Halo8"
 
     datadir = args.data_dir or default_datadir
@@ -308,6 +308,11 @@ def main(argv=None):
             patience=2000,
             verbose=True,
             log_rank_zero_only=True,
+            # PL 2.x runs EarlyStopping at both train- and val-epoch-end by
+            # default, but val_ep_scaled_err is only logged in
+            # on_validation_epoch_end — so the train-side hook sees the metric
+            # as "not available" and raises. Restrict to val-side only.
+            check_on_train_epoch_end=False,
         ),
         ModelCheckpoint(
             monitor="val_ep_scaled_err",

@@ -24,8 +24,10 @@ from torch.utils.data import Dataset
 from torch_geometric.data import Batch, Data
 
 
-# Atom mapping for Halo8 dataset: H, C, N, O, F, S, Br
-HALO_ATOM_MAPPING = {1: 0, 6: 1, 7: 2, 8: 3, 9: 4, 16: 5, 35: 6}
+# Atom mapping for Halo8 dataset: H, C, N, O, F, S, Cl, Br (8 element types —
+# hence the "Halo8" name). Ordered by atomic number so one-hot indices are
+# easy to inspect.
+HALO_ATOM_MAPPING = {1: 0, 6: 1, 7: 2, 8: 3, 9: 4, 16: 5, 17: 6, 35: 7}
 N_HALO_ATOM_TYPES = len(HALO_ATOM_MAPPING)
 
 # Compiled once at import time.
