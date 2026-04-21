@@ -60,7 +60,7 @@ pip install pytorch-lightning==2.4.0 torchmetrics
 echo "=========================================="
 echo "Step 5/7  Data / chemistry libraries"
 echo "=========================================="
-pip install pandas "ase>=3.23" pymatgen networkx lmdb tqdm
+pip install pandas matplotlib "ase>=3.23" pymatgen networkx lmdb tqdm
 
 echo "=========================================="
 echo "Step 6/7  Training tools (wandb, ODE, logging)"
@@ -79,7 +79,7 @@ echo "=========================================="
 python - <<'PY'
 import importlib, sys
 mods = [
-    "torch", "numpy", "pandas", "pytorch_lightning", "torchmetrics",
+    "torch", "numpy", "pandas", "matplotlib", "pytorch_lightning", "torchmetrics",
     "torch_geometric", "torch_scatter", "torch_sparse", "torch_cluster",
     "torchdiffeq", "ase", "pymatgen", "networkx", "lmdb", "tqdm",
     "wandb", "timm", "rich", "ipdb", "reactot",

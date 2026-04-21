@@ -181,11 +181,34 @@ echo "Module  : reactot.trainer.train_rpsb_ts1x"
 echo "PYTHONPATH : $PYTHONPATH"
 echo "=========================================="
 
-python -u -m reactot.trainer.train_rpsb_ts1x --dataset Halo8
+# --no-wandb routes all PL metrics to logs/<run_name>/<run_name>/version_*/metrics.csv
+# (CSVLogger) instead of wandb. Set USE_WANDB=1 at submission time to re-enable
+# wandb: `USE_WANDB=1 sbatch run_halo8_slurm.sh` (requires WANDB_API_KEY).
+WANDB_FLAG="--no-wandb"
+if [ "${USE_WANDB:-0}" = "1" ]; then
+    WANDB_FLAG=""
+fi
+
+python -u -m reactot.trainer.train_rpsb_ts1x --dataset Halo8 $WANDB_FLAG
 
 EXIT_CODE=$?
 
 echo "=========================================="
 echo "Training finished at $(date) — exit code $EXIT_CODE"
 echo "=========================================="
+
+# ===========================================================================
+# Post-training: convert the CSVLogger metrics to PNG plots so the results
+# are viewable without wandb. `plot_metrics.py` auto-finds the newest
+# metrics.csv under logs/ and drops PNGs next to it under plots/.
+# Only runs when --no-wandb is active (i.e. WANDB_FLAG is non-empty and CSV
+# metrics exist).
+# ===========================================================================
+if [ -n "$WANDB_FLAG" ]; then
+    echo "=========================================="
+    echo "Generating plots from CSV metrics..."
+    echo "=========================================="
+    python -u plot_metrics.py || echo "WARN: plot_metrics.py failed (non-fatal)"
+fi
+
 exit $EXIT_CODE
