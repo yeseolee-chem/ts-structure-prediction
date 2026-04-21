@@ -283,11 +283,14 @@ def main(argv=None):
     config.update(cfgs["optimizer_config"])
     config.update(training_config)
 
+    # Checkpoint directory is always keyed by the local run_name (uuid-based)
+    # so it is predictable regardless of wandb mode (online / offline / disabled).
+    ckpt_path = f"checkpoint/{cfgs['project']}/{run_name}"
+
     if args.no_wandb:
         csv_dir = os.path.join("logs", "smoke" if args.smoke_test else run_name)
         os.makedirs(csv_dir, exist_ok=True)
         logger = CSVLogger(save_dir=csv_dir, name=run_name)
-        ckpt_path = f"checkpoint/{cfgs['project']}/{run_name}"
     else:
         wandb_logger = WandbLogger(
             project=cfgs["project"], log_model=False, name=run_name
@@ -300,7 +303,8 @@ def main(argv=None):
         except Exception:
             pass
         logger = wandb_logger
-        ckpt_path = f"checkpoint/{cfgs['project']}/{wandb_logger.experiment.name}"
+
+    print(f"Checkpoint dir : {ckpt_path}")
 
     callbacks = [
         EarlyStopping(
