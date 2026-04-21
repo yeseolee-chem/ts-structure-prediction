@@ -28,7 +28,9 @@
 # ===========================================================================
 
 # ---- Data / paths ----------------------------------------------------------
-DATA_LIMIT=${DATA_LIMIT:-100}      # reaction groups to sample; 0 = full dataset
+DATA_LIMIT=${DATA_LIMIT:-300}      # reaction groups to sample; 0 = full dataset
+                                    # 300 + 300 epochs ≈ 1h on A10 (iteration)
+                                    # 1000 + 3000 epochs ≈ 29h (production-ish)
 DATASET_PREFIX=${DATASET_PREFIX:-"Halogen"}   # "Halogen", "T1x", or "Mix"
 REPO_DIR=${REPO_DIR:-"${SLURM_SUBMIT_DIR:-$(pwd)}"}
 CONDA_ENV=${CONDA_ENV:-"reactot"}

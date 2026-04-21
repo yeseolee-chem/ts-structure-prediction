@@ -304,18 +304,23 @@ def main(argv=None):
             pass
         logger = wandb_logger
 
+    # Pre-create checkpoint dir — PL 2.x ModelCheckpoint usually does this
+    # lazily but has been observed to silently skip saves when the parent
+    # directory doesn't yet exist at trainer init.
+    os.makedirs(ckpt_path, exist_ok=True)
     print(f"Checkpoint dir : {ckpt_path}")
 
     callbacks = [
         EarlyStopping(
             monitor="val_ep_scaled_err",
-            # patience=30 chosen for DATA_LIMIT=1000 smoke/test runs:
+            # patience=30 chosen for DATA_LIMIT=300 iteration runs:
             #   * val is drawn from 20 batches → noisy RMSD, needs buffer
             #   * EMA (decay=0.999) stabilizes slowly → 15-40 epoch plateaus
             #     are common before the loss drops again
             #   * min_delta=1e-4 filters out sub-noise "improvements" so the
             #     counter only advances on genuine plateaus.
-            # For a full-dataset production run bump patience to ~100.
+            # For a full-dataset production run bump patience to ~100 and
+            # max_epochs back up to 3000.
             patience=30,
             min_delta=1e-4,
             verbose=True,
@@ -332,6 +337,14 @@ def main(argv=None):
             filename="sb-{epoch:03d}-{val_ep_scaled_err:.4f}",
             every_n_epochs=save_epochs,
             save_top_k=-1,
+            # Always keep a 'last.ckpt' as a safety net — even if the monitor
+            # filename is skipped due to a missing metric on a given epoch,
+            # last.ckpt lets us resume / evaluate the final weights.
+            save_last=True,
+            # Mirror the EarlyStopping fix: only save at val-epoch-end so
+            # val_ep_scaled_err is guaranteed to be available for the
+            # filename substitution / monitor bookkeeping.
+            save_on_train_epoch_end=False,
         ),
         TQDMProgressBar(),
         LearningRateMonitor(logging_interval="step"),
@@ -358,7 +371,9 @@ def main(argv=None):
             devices = [0]
 
     trainer_kwargs = dict(
-        max_epochs=3000,
+        # max_epochs=300 for lightweight iteration (DATA_LIMIT=300, ~1h on A10).
+        # Bump to 3000 for a full-dataset production run.
+        max_epochs=300,
         accelerator=accelerator,
         deterministic=False,
         devices=devices,
