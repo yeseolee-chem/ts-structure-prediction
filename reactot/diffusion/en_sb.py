@@ -5,7 +5,7 @@ from tqdm import tqdm
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
-from torch_scatter import scatter_mean
+from torch_scatter import scatter_mean, scatter_add
 
 from reactot.dynamics import EGNNDynamics
 from reactot.utils import (
@@ -262,9 +262,16 @@ class EnSB(nn.Module):
         representations: List[Dict],
         conditions: Union[Tensor, Dict],
         ot_ode: bool = True,
+        atom_weights: Optional[Tensor] = None,
     ):
         r"""
         Computes the loss and NLL terms.
+
+        Args:
+            atom_weights: (n_atoms,) per-atom weights for the target fragment.
+                If None, uniform weights (standard MSE) are used. Otherwise
+                loss is sum_i(w_i * ||pred_i - label_i||^2) / sum_i(w_i),
+                per molecule, then averaged over the batch.
 
         #TODO: edge_attr not considered at all
         """
@@ -275,6 +282,12 @@ class EnSB(nn.Module):
         edge_index = get_edges_index(combined_mask, remove_self_edge=True)
         fragments_nodes = [repr["size"] for repr in representations]
         n_frag_switch = get_n_frag_switch(fragments_nodes)
+
+        # Graph-distance atom weights for the target fragment. If caller did
+        # not pass them, fall back to per-representation dict so data loaders
+        # that precompute weights still work.
+        if atom_weights is None:
+            atom_weights = representations[self.idx].get("atom_weights", None)
 
         # Normalize data, take into account volume change in x.
         representations = self.normalizer.normalize(representations)
@@ -334,7 +347,24 @@ class EnSB(nn.Module):
         pred = net_eps_xh[self.idx][:, : self.pos_dim]
         label = self.compute_label(timestep.squeeze(), x0, xt)
 
-        loss = F.mse_loss(pred, label)
+        if atom_weights is not None:
+            # atom_weights: (n_target_atoms,) — precomputed continuous weights.
+            # sq_error summed over pos_dim per atom, then per-molecule
+            # weight-normalized mean (Idea 1-A spec):
+            #     loss_m = sum_i(w_i * ||pred_i - label_i||^2) / sum_i(w_i)
+            #     loss   = mean_m(loss_m) / pos_dim
+            # The /pos_dim keeps the scale comparable to F.mse_loss so the
+            # optimizer hyperparameters remain valid.
+            sq_error = (pred - label).pow(2).sum(dim=-1)  # (n_target_atoms,)
+            target_mask = masks[self.idx].to(sq_error.device)
+            atom_weights = atom_weights.to(sq_error.device).to(sq_error.dtype)
+            weighted_sq_error = atom_weights * sq_error
+            weighted_sum = scatter_add(weighted_sq_error, target_mask, dim=0)
+            weight_sum = scatter_add(atom_weights, target_mask, dim=0)
+            per_mol_loss = weighted_sum / (weight_sum + 1e-8)
+            loss = per_mol_loss.mean() / self.pos_dim
+        else:
+            loss = F.mse_loss(pred, label)
         scaled_err = compute_scaled_err(pred, label)
 
         loss_terms = {

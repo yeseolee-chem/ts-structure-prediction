@@ -318,10 +318,17 @@ class SBModule(LightningModule):
 
     def compute_loss(self, batch):
         representations, conditions = batch
+        # Idea 1-A: pull precomputed graph-distance atom weights off the
+        # target fragment. When the dataset was built without weighting
+        # (e.g., zero_charge=True or graph_weights_enabled=False) this is
+        # None and the forward falls back to uniform F.mse_loss.
+        target_rep = representations[self.ddpm.idx]
+        atom_weights = target_rep.get("atom_weights", None)
         loss_terms = self.ddpm.forward(
             representations,
             conditions,
             ot_ode=self.ot_ode,
+            atom_weights=atom_weights,
         )
         info = {
             "loss": loss_terms["loss"],

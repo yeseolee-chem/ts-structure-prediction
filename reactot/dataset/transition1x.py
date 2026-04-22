@@ -41,6 +41,9 @@ class ProcessedTS1x(BaseDataset):
         ts_guess=False,
         react_type=None,
         atom_mapping=ATOM_MAPPING,
+        graph_weights_enabled: bool = True,
+        graph_weights_w_min: float = 0.1,
+        graph_weights_lambda: float = 2.0,
         **kwargs,
     ):
         super().__init__(
@@ -156,3 +159,15 @@ class ProcessedTS1x(BaseDataset):
                 torch.zeros(size=(1, 1), dtype=torch.int64, device=self.device,)
                 for _ in range(self.n_samples)
             ]
+
+        if graph_weights_enabled and not only_ts and not only_rp and not zero_charge:
+            # Idea 1-A: graph-distance exponential-decay atom weights.
+            # Requires R and P positions (indices 0 and 2 in standard layout)
+            # plus atomic numbers in charge_{0}. Skip silently for data
+            # layouts where these are absent (only_ts/only_rp) or when
+            # atomic numbers are zeroed out (zero_charge).
+            self.attach_atom_weights(
+                r_idx=0, p_idx=2, n_fragments=3,
+                w_min=graph_weights_w_min,
+                lambda_decay=graph_weights_lambda,
+            )
