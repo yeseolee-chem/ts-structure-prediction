@@ -316,7 +316,7 @@ def main(argv=None):
             dirpath=ckpt_path,
             filename="sb-{epoch:03d}-{val_ep_scaled_err:.4f}",
             every_n_epochs=save_epochs,
-            save_top_k=-1,
+            save_top_k=3,
             # Always keep a 'last.ckpt' as a safety net — even if the monitor
             # filename is skipped due to a missing metric on a given epoch,
             # last.ckpt lets us resume / evaluate the final weights.
