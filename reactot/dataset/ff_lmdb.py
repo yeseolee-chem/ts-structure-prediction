@@ -511,33 +511,56 @@ class ProcessedHalo8(Dataset):
         if max_db_files is not None and max_db_files > 0:
             db_paths = db_paths[: int(max_db_files)]
 
-        global_groups: dict = {}
-        per_file_cap = None
-        if data_limit is not None:
-            per_file_cap = data_limit * 3
-        for db_idx, db_path in enumerate(db_paths):
-            rxn_groups, _total, _matched = _index_rxn_groups(
-                db_path, prefix, max_groups=per_file_cap
-            )
-            for base_rxn, conformers in rxn_groups.items():
-                entries = global_groups.setdefault(base_rxn, [])
-                for row_id, conf_idx, energy in conformers:
-                    entries.append((db_idx, row_id, conf_idx, energy))
-            # Early termination for small data_limit: stop scanning further
-            # files once we already have enough reaction groups. This is a
-            # smoke-test fast-path; full SLURM runs set data_limit=None.
-            if data_limit is not None and len(global_groups) >= data_limit * 3:
-                break
+        # `prefix` is already a normalized tuple, e.g. ('T1x',) or
+        # ('Halogen', 'T1x').  When there are multiple prefixes (Mix mode)
+        # we sample independently from each prefix so that the final
+        # dataset contains exactly data_limit // n_prefixes reactions from
+        # each prefix.  This prevents the old early-termination bug where
+        # scanning stopped after finding data_limit groups from the first
+        # file — which happened to be all T1x — making Mix identical to T1x.
+        n_prefixes = len(prefix)
+        per_prefix_limit = (data_limit // n_prefixes) if data_limit is not None else None
 
-        all_rxn_keys = sorted(global_groups.keys())
         if seed is not None:
             rng = random.Random(seed)
         else:
             rng = random
-        if data_limit is not None and data_limit < len(all_rxn_keys):
-            chosen_keys = rng.sample(all_rxn_keys, data_limit)
-        else:
-            chosen_keys = all_rxn_keys
+
+        global_groups: dict = {}
+
+        for single_prefix in prefix:
+            prefix_groups: dict = {}
+            # Cap per-file scan to 3× the quota for this prefix so we don't
+            # read the whole (multi-million row) file when data_limit is small.
+            per_file_cap = per_prefix_limit * 3 if per_prefix_limit is not None else None
+
+            for db_idx, db_path in enumerate(db_paths):
+                rxn_groups, _total, _matched = _index_rxn_groups(
+                    db_path, single_prefix, max_groups=per_file_cap
+                )
+                for base_rxn, conformers in rxn_groups.items():
+                    entries = prefix_groups.setdefault(base_rxn, [])
+                    for row_id, conf_idx, energy in conformers:
+                        entries.append((db_idx, row_id, conf_idx, energy))
+                # Early termination: once we have enough candidates for this
+                # prefix, stop scanning further files.
+                if per_prefix_limit is not None and len(prefix_groups) >= per_prefix_limit * 3:
+                    break
+
+            # Randomly sample per_prefix_limit groups from this prefix.
+            prefix_keys = sorted(prefix_groups.keys())
+            if per_prefix_limit is not None and per_prefix_limit < len(prefix_keys):
+                sampled = rng.sample(prefix_keys, per_prefix_limit)
+            else:
+                sampled = prefix_keys
+            logger.info(
+                "prefix=%s: %d candidate groups, selected %d",
+                single_prefix, len(prefix_keys), len(sampled),
+            )
+            for k in sampled:
+                global_groups[k] = prefix_groups[k]
+
+        chosen_keys = list(global_groups.keys())
 
         groups_per_frag: dict = {0: [], 1: [], 2: []}
         conn_cache: dict = {}
