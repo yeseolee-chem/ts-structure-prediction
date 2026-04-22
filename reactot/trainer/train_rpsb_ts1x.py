@@ -325,11 +325,12 @@ def main(argv=None):
             min_delta=1e-4,
             verbose=True,
             log_rank_zero_only=True,
-            # PL 2.x runs EarlyStopping at both train- and val-epoch-end by
-            # default, but val_ep_scaled_err is only logged in
-            # on_validation_epoch_end — so the train-side hook sees the metric
-            # as "not available" and raises. Restrict to val-side only.
-            check_on_train_epoch_end=False,
+            # val_ep_scaled_err is logged from SBModule.on_train_epoch_end
+            # (manual validation pass), so EarlyStopping must fire on the
+            # train-epoch-end hook where that metric is available. Auto
+            # validation is disabled (check_val_every_n_epoch=1e9), so the
+            # val-epoch-end hook only fires during sanity checking.
+            check_on_train_epoch_end=True,
         ),
         ModelCheckpoint(
             monitor="val_ep_scaled_err",
@@ -341,10 +342,11 @@ def main(argv=None):
             # filename is skipped due to a missing metric on a given epoch,
             # last.ckpt lets us resume / evaluate the final weights.
             save_last=True,
-            # Mirror the EarlyStopping fix: only save at val-epoch-end so
-            # val_ep_scaled_err is guaranteed to be available for the
-            # filename substitution / monitor bookkeeping.
-            save_on_train_epoch_end=False,
+            # Manual validation runs inside SBModule.on_train_epoch_end, so
+            # val_ep_scaled_err is available in the train-epoch-end metrics
+            # dict. Save there instead of on val-epoch-end (auto val is
+            # disabled via check_val_every_n_epoch=1e9).
+            save_on_train_epoch_end=True,
         ),
         TQDMProgressBar(),
         LearningRateMonitor(logging_interval="step"),
@@ -386,6 +388,13 @@ def main(argv=None):
         limit_train_batches=200,
         limit_val_batches=20,
         use_distributed_sampler=False,
+        # Disable PL's auto end-of-epoch validation. The
+        # (batch_idx+1) % val_check_batch == 0 schedule gets stuck at 42
+        # when DynamicBatchSampler's __len__ overestimates the per-epoch
+        # yield (Halo8 T1x runs ~10 batches/epoch), so auto-validation is
+        # silently skipped. SBModule.on_train_epoch_end runs validation
+        # manually every epoch instead. Sanity check still runs.
+        check_val_every_n_epoch=10 ** 9,
     )
     if strategy is not None:
         trainer_kwargs["strategy"] = strategy

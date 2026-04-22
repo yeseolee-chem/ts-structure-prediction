@@ -480,6 +480,68 @@ class SBModule(LightningModule):
             self.log(f"tr_{k}", v, sync_dist=True)
         self._train_step_outputs.clear()
 
+        # PL's auto-validation schedules via (batch_idx+1) % val_check_batch == 0,
+        # which silently skips validation whenever DynamicBatchSampler's __len__
+        # overestimates the per-epoch yield (Halo8 T1x: __len__ claims 42, iter
+        # yields ~10 because molecules are small). Run validation ourselves so
+        # val_* metrics are always logged — EarlyStopping/ModelCheckpoint then
+        # read a populated monitor every epoch.
+        if not getattr(self.trainer, "sanity_checking", False):
+            self._run_manual_validation()
+
+    @torch.no_grad()
+    def _run_manual_validation(self) -> None:
+        """Run one validation pass and log aggregated val_* metrics.
+
+        Lives in the train-epoch-end hook rather than relying on PL's
+        batch-index-based val scheduler, which breaks when a custom
+        batch-sampler's __len__ disagrees with its actual iteration count.
+        Swaps EMA weights in/out via the existing EMACallback so this mirrors
+        what PL would have done through on_validation_epoch_start/end.
+        """
+        from reactot.trainer.ema import EMACallback
+
+        trainer = self.trainer
+        ema_cb = None
+        if trainer is not None:
+            for cb in getattr(trainer, "callbacks", []) or []:
+                if isinstance(cb, EMACallback):
+                    ema_cb = cb
+                    break
+
+        if ema_cb is not None:
+            ema_cb.store(self.parameters())
+            ema_cb.copy_to(ema_cb.ema.module.parameters(), self.parameters())
+
+        try:
+            loader = self.val_dataloader()
+            limit = getattr(trainer, "limit_val_batches", None) if trainer is not None else None
+            if not isinstance(limit, int):
+                limit = None  # float fraction or None → iterate all batches
+
+            self.ddpm.eval()
+            try:
+                for batch_idx, batch in enumerate(loader):
+                    if limit is not None and batch_idx >= limit:
+                        break
+                    batch = self.transfer_batch_to_device(
+                        batch, self.device, dataloader_idx=0
+                    )
+                    info = self._shared_eval(batch, batch_idx, "val")
+                    self._val_step_outputs.append(info)
+            finally:
+                self.ddpm.train()
+
+            val_epoch_metrics = average_over_batch_metrics(self._val_step_outputs)
+            if trainer is not None and trainer.is_global_zero:
+                pretty_print(self.current_epoch, val_epoch_metrics, prefix="val")
+            for k, v in val_epoch_metrics.items():
+                self.log(k, v, sync_dist=True, on_epoch=True)
+            self._val_step_outputs.clear()
+        finally:
+            if ema_cb is not None:
+                ema_cb.restore(self.parameters())
+
     def configure_gradient_clipping(
         self,
         optimizer,
