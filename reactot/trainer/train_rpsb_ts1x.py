@@ -352,9 +352,9 @@ def main(argv=None):
             devices = [0]
 
     trainer_kwargs = dict(
-        # max_epochs=300 for lightweight iteration (DATA_LIMIT=300, ~1h on A10).
-        # Bump to 3000 for a full-dataset production run.
-        max_epochs=300,
+        # max_epochs=1000 for mid-scale runs (DATA_LIMIT=1000, ~11h on A10).
+        # Use 300 for quick iteration (DATA_LIMIT=300, ~1h) or 3000 for full-dataset.
+        max_epochs=1000,
         accelerator=accelerator,
         deterministic=False,
         devices=devices,
