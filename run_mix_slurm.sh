@@ -29,5 +29,23 @@
 export DATASET_PREFIX=Mix
 export DATA_LIMIT=${DATA_LIMIT:-300}
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# SLURM copies submitted scripts to /var/spool/slurmd/jobNNN/ and runs them
+# from there, so BASH_SOURCE[0] doesn't point at the repo. Prefer
+# $SLURM_SUBMIT_DIR (the directory where `sbatch` was invoked) and fall back
+# to BASH_SOURCE for local execution outside SLURM.
+if [ -n "${REPO_DIR:-}" ]; then
+    SCRIPT_DIR="$REPO_DIR"
+elif [ -n "${SLURM_SUBMIT_DIR:-}" ]; then
+    SCRIPT_DIR="$SLURM_SUBMIT_DIR"
+else
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+export REPO_DIR="$SCRIPT_DIR"
+
+if [ ! -f "$SCRIPT_DIR/run_halo8_slurm.sh" ]; then
+    echo "ERROR: run_halo8_slurm.sh not found under $SCRIPT_DIR" >&2
+    echo "       Submit from the repo root, or set REPO_DIR=<repo> sbatch run_mix_slurm.sh" >&2
+    exit 1
+fi
+
 exec bash "$SCRIPT_DIR/run_halo8_slurm.sh" "$@"
