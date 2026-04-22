@@ -250,28 +250,56 @@ def plot_summary(df: pd.DataFrame, out: Path) -> bool:
 # ---------------------------------------------------------------------------
 # Best-epoch textual summary (handy when you can't open the PNGs remotely)
 # ---------------------------------------------------------------------------
-def print_summary(df: pd.DataFrame) -> None:
-    def _stat(col: str, how: str = "min"):
+_SUMMARY_COLS = [
+    ("val_ep_rmsd_median", "val RMSD median (Å)"),
+    ("val_ep_rmsd_mean",   "val RMSD mean (Å)"),
+    ("val_ep_rmsd_std",    "val RMSD std (Å)"),
+    ("val_ep_scaled_err",  "val scaled err"),
+    ("val_ep_loss",        "val loss"),
+]
+
+
+def _best_epoch_rows(df: pd.DataFrame):
+    rows = []
+    for col, label in _SUMMARY_COLS:
         data = _collapse_by_epoch(df, col)
         if data.empty:
-            return None, None
-        idx = data[col].idxmin() if how == "min" else data[col].idxmax()
-        return float(data.loc[idx, col]), int(data.loc[idx, "epoch"])
-
-    print("")
-    print("====== Best-epoch summary ======")
-    for col, label in [
-        ("val_ep_rmsd_median", "val RMSD median (Å)"),
-        ("val_ep_rmsd_mean",   "val RMSD mean (Å)"),
-        ("val_ep_scaled_err",  "val scaled err"),
-        ("val_ep_loss",        "val loss"),
-    ]:
-        val, epoch = _stat(col, "min")
-        if val is None:
-            print(f"  {label:30s} : (not logged)")
+            rows.append((label, None, None))
         else:
-            print(f"  {label:30s} : {val:.5f}   @ epoch {epoch}")
-    print("================================")
+            idx = data[col].idxmin()
+            rows.append(
+                (label, float(data.loc[idx, col]), int(data.loc[idx, "epoch"]))
+            )
+    return rows
+
+
+def _format_summary(rows, header: str) -> str:
+    lines = [f"====== {header} ======"]
+    for label, val, epoch in rows:
+        if val is None:
+            lines.append(f"  {label:30s} : (not logged)")
+        else:
+            lines.append(f"  {label:30s} : {val:.5f}   @ epoch {epoch}")
+    lines.append("=" * (len(header) + 14))
+    return "\n".join(lines)
+
+
+def print_summary(df: pd.DataFrame) -> None:
+    rows = _best_epoch_rows(df)
+    print("")
+    print(_format_summary(rows, "Best-epoch summary"))
+
+
+def write_summary_file(df: pd.DataFrame, out_path: Path, csv_path: Path) -> None:
+    """Persist the best-epoch RMSD summary to a plain-text result file."""
+    rows = _best_epoch_rows(df)
+    run_label = csv_path.parent.parent.name  # logs/<run>/<run>/version_X/metrics.csv
+    body = _format_summary(rows, f"RMSD summary — {run_label}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(body + "\n")
+        fh.write(f"\nSource CSV : {csv_path}\n")
+    print(f"RESULT : {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +342,14 @@ def main(argv=None):
             print(f"         {out_dir / name}")
 
     print_summary(df)
+
+    # Persist the same RMSD summary to results/<run>_rmsd_summary.txt so there
+    # is a proper "result file" on disk (paired with the PNGs under plots/).
+    run_label = csv_path.parent.parent.name
+    repo_root = Path(__file__).resolve().parent
+    results_dir = repo_root / "results"
+    summary_path = results_dir / f"{run_label}_rmsd_summary.txt"
+    write_summary_file(df, summary_path, csv_path)
 
 
 if __name__ == "__main__":
