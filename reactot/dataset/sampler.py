@@ -93,6 +93,31 @@ class DynamicBatchSampler(Sampler):
         self.batch_size = self.max_num // 400
         if self.max_batch is None:
             self.max_batch = len(dataset) // self.batch_size
+
+        # Empirical calibration of the reported length. The `max_num // 400`
+        # heuristic above assumes avg node^2 ≈ 400 (~20-atom molecules). When
+        # the dataset's molecules are smaller, __iter__ packs many more
+        # samples per batch and exhausts RandomSampler well before max_batch
+        # is reached — so __len__ overreports the per-epoch batch count.
+        # PL 2.x derives val_check_batch from __len__, schedules validation
+        # at batch N=__len__, then never reaches N (epoch ends at StopIteration
+        # earlier), so validation is silently skipped every epoch. Probe a
+        # handful of samples to get an accurate length without scanning the
+        # whole dataset.
+        self._reported_len = self.max_batch
+        try:
+            probe = min(len(dataset), 64)
+            if probe > 0:
+                avg_n = sum(
+                    self.mode_calc(dataset[i]["size_0"].item())
+                    for i in range(probe)
+                ) / probe
+                if avg_n > 0:
+                    empirical_bs = max(1, int(self.max_num / avg_n))
+                    empirical_len = max(1, len(dataset) // empirical_bs)
+                    self._reported_len = min(empirical_len, self.max_batch)
+        except (KeyError, AttributeError, RuntimeError, IndexError):
+            pass
         
     @staticmethod
     def node_calc(x):
@@ -139,4 +164,4 @@ class DynamicBatchSampler(Sampler):
             yield batch
 
     def __len__(self) -> int:
-        return self.max_batch
+        return self._reported_len
