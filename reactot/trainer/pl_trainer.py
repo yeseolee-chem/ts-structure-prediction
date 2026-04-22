@@ -535,8 +535,17 @@ class SBModule(LightningModule):
             val_epoch_metrics = average_over_batch_metrics(self._val_step_outputs)
             if trainer is not None and trainer.is_global_zero:
                 pretty_print(self.current_epoch, val_epoch_metrics, prefix="val")
+            # _shared_eval prefixes RMSD keys as "val_rmsd_*" but plot_metrics.py
+            # and the EarlyStopping/ModelCheckpoint monitors expect "val_ep_rmsd_*".
+            # Rename here so the CSV columns match what every downstream consumer
+            # (plot_metrics.py _SUMMARY_COLS, rmsd_summary.txt) looks for.
+            _RENAME = {
+                "val_rmsd_mean":   "val_ep_rmsd_mean",
+                "val_rmsd_median": "val_ep_rmsd_median",
+                "val_rmsd_std":    "val_ep_rmsd_std",
+            }
             for k, v in val_epoch_metrics.items():
-                self.log(k, v, sync_dist=True, on_epoch=True)
+                self.log(_RENAME.get(k, k), v, sync_dist=True, on_epoch=True)
             self._val_step_outputs.clear()
         finally:
             if ema_cb is not None:
