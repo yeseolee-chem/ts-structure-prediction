@@ -10,7 +10,7 @@ import torch
 from reactot.trainer.pl_trainer import SBModule
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks.progress import TQDMProgressBar
-from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger, CSVLogger
 from pytorch_lightning.strategies.ddp import DDPStrategy
 
@@ -311,27 +311,6 @@ def main(argv=None):
     print(f"Checkpoint dir : {ckpt_path}")
 
     callbacks = [
-        EarlyStopping(
-            monitor="val_ep_scaled_err",
-            # patience=30 chosen for DATA_LIMIT=300 iteration runs:
-            #   * val is drawn from 20 batches → noisy RMSD, needs buffer
-            #   * EMA (decay=0.999) stabilizes slowly → 15-40 epoch plateaus
-            #     are common before the loss drops again
-            #   * min_delta=1e-4 filters out sub-noise "improvements" so the
-            #     counter only advances on genuine plateaus.
-            # For a full-dataset production run bump patience to ~100 and
-            # max_epochs back up to 3000.
-            patience=30,
-            min_delta=1e-4,
-            verbose=True,
-            log_rank_zero_only=True,
-            # val_ep_scaled_err is logged from SBModule.on_train_epoch_end
-            # (manual validation pass), so EarlyStopping must fire on the
-            # train-epoch-end hook where that metric is available. Auto
-            # validation is disabled (check_val_every_n_epoch=1e9), so the
-            # val-epoch-end hook only fires during sanity checking.
-            check_on_train_epoch_end=True,
-        ),
         ModelCheckpoint(
             monitor="val_ep_scaled_err",
             dirpath=ckpt_path,
