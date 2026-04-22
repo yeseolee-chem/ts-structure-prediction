@@ -26,6 +26,12 @@
 #SBATCH --mem=64G
 #SBATCH --time=48:00:00
 
+# =============== SCRIPT_VERSION: reactof-halo8 / self-contained ============
+# If you DO NOT see the line above in the job log, you are running a stale
+# copy — on the server: `cd ~/projects/ts-structure-prediction && git pull`.
+# ===========================================================================
+echo ">>> run_mix_slurm.sh VERSION: reactof-halo8 self-contained (no delegation)"
+
 # ---- Fixed dataset selector for this wrapper -------------------------------
 DATASET_PREFIX="Mix"
 
