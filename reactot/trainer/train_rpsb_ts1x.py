@@ -16,6 +16,7 @@ from pytorch_lightning.strategies.ddp import DDPStrategy
 
 from reactot.trainer.ema import EMACallback
 from reactot.model import LEFTNet
+from reactot.utils.weighting import ELEMENT_IMPORTANCE
 
 
 class OPT:
@@ -71,6 +72,41 @@ def parse_args(argv=None):
         default=None,
         help="Halo8 only: dand_id prefix filter. 'Mix' accepts both Halogen "
         "and T1x. Falls back to the DATASET_PREFIX env var, then 'Halogen'.",
+    )
+    # Idea 1-B: element-aware FM loss weighting.
+    p.add_argument(
+        "--element-aware-weights",
+        action="store_true",
+        help="Idea 1-B: multiply graph-distance weight by per-element α_Z and "
+        "normalize per-molecule. Requires graph_weights_enabled (default).",
+    )
+    p.add_argument(
+        "--alpha-h", type=float, default=None, help="α_Z override for H (Z=1).")
+    p.add_argument(
+        "--alpha-c", type=float, default=None, help="α_Z override for C (Z=6).")
+    p.add_argument(
+        "--alpha-n", type=float, default=None, help="α_Z override for N (Z=7).")
+    p.add_argument(
+        "--alpha-o", type=float, default=None, help="α_Z override for O (Z=8).")
+    p.add_argument(
+        "--alpha-f", type=float, default=None, help="α_Z override for F (Z=9).")
+    p.add_argument(
+        "--alpha-s", type=float, default=None, help="α_Z override for S (Z=16).")
+    p.add_argument(
+        "--alpha-cl", type=float, default=None, help="α_Z override for Cl (Z=17).")
+    p.add_argument(
+        "--alpha-br", type=float, default=None, help="α_Z override for Br (Z=35).")
+    p.add_argument(
+        "--graph-w-min",
+        type=float,
+        default=None,
+        help="Override w_min (graph-distance decay floor; default 0.1).",
+    )
+    p.add_argument(
+        "--graph-lambda",
+        type=float,
+        default=None,
+        help="Override λ (graph-distance decay length; default 2.0).",
     )
     args = p.parse_args(argv)
 
@@ -137,6 +173,27 @@ def build_configs(args):
             "Halo8 requires --data-dir or HALO8_DATADIR to be set."
         )
 
+    # Idea 1-B: assemble α_Z dict from CLI overrides on top of defaults.
+    # If no override is provided, we pass None so the dataset uses the library
+    # default ELEMENT_IMPORTANCE.
+    alpha_overrides = {
+        1:  args.alpha_h,
+        6:  args.alpha_c,
+        7:  args.alpha_n,
+        8:  args.alpha_o,
+        9:  args.alpha_f,
+        16: args.alpha_s,
+        17: args.alpha_cl,
+        35: args.alpha_br,
+    }
+    if any(v is not None for v in alpha_overrides.values()):
+        element_alpha = dict(ELEMENT_IMPORTANCE)  # start from defaults
+        for z, v in alpha_overrides.items():
+            if v is not None:
+                element_alpha[z] = float(v)
+    else:
+        element_alpha = None  # → dataset falls back to ELEMENT_IMPORTANCE
+
     training_config = dict(
         datadir=datadir,
         remove_h=False,
@@ -161,6 +218,16 @@ def build_configs(args):
             shuffle=True,
             ddp=False,
         ),
+        # Idea 1-A / 1-B: per-atom FM loss weighting.
+        graph_weights_enabled=True,
+        graph_weights_w_min=(
+            args.graph_w_min if args.graph_w_min is not None else 0.1
+        ),
+        graph_weights_lambda=(
+            args.graph_lambda if args.graph_lambda is not None else 2.0
+        ),
+        element_aware_weights=bool(args.element_aware_weights),
+        element_alpha=element_alpha,
     )
     if args.dataset == "Halo8":
         training_config["data_limit"] = args.data_limit

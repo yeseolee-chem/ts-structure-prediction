@@ -6,7 +6,10 @@ from torch.utils.data import Dataset
 import torch.nn.functional as F
 
 from reactot.dataset.datasets_config import ATOM_MAPPING, SAM_CHARGED_ATOM_MAPPING
-from reactot.utils.weighting import compute_weights_for_batch
+from reactot.utils.weighting import (
+    compute_weights_for_batch,
+    compute_element_weights_for_batch,
+)
 
 
 class BaseDataset(Dataset):
@@ -94,6 +97,8 @@ class BaseDataset(Dataset):
         n_fragments: int = 3,
         w_min: float = 0.1,
         lambda_decay: float = 2.0,
+        element_aware: bool = False,
+        alpha_dict: dict = None,
     ):
         """Precompute graph-distance-based continuous atom weights per sample.
 
@@ -108,6 +113,9 @@ class BaseDataset(Dataset):
             n_fragments: number of fragments to replicate weights across.
             w_min: minimum weight at graph-infinity (Idea 1-A default 0.1).
             lambda_decay: decay length in hop units (Idea 1-A default 2.0).
+            element_aware: Idea 1-B — multiply by α_Z and normalize per-molecule.
+            alpha_dict: custom per-element α_Z (only used if element_aware).
+                When None, uses ELEMENT_IMPORTANCE defaults.
         """
         pos_R_list = self.data[f"pos_{r_idx}"]
         pos_P_list = self.data[f"pos_{p_idx}"]
@@ -123,10 +131,17 @@ class BaseDataset(Dataset):
             pos_R = pos_R_t.detach().cpu().numpy().astype(np.float64)
             pos_P = pos_P_t.detach().cpu().numpy().astype(np.float64)
             atomic_numbers = charge_t.detach().cpu().numpy().reshape(-1).astype(np.int64)
-            w = compute_weights_for_batch(
-                pos_R, pos_P, atomic_numbers,
-                w_min=w_min, lambda_decay=lambda_decay,
-            )
+            if element_aware:
+                w = compute_element_weights_for_batch(
+                    pos_R, pos_P, atomic_numbers,
+                    w_min=w_min, lambda_decay=lambda_decay,
+                    custom_alpha=alpha_dict,
+                )
+            else:
+                w = compute_weights_for_batch(
+                    pos_R, pos_P, atomic_numbers,
+                    w_min=w_min, lambda_decay=lambda_decay,
+                )
             weights_per_sample.append(
                 torch.tensor(w, dtype=torch.float32, device=self.device)
             )

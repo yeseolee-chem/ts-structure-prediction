@@ -239,3 +239,118 @@ def compute_weights_torch(graph_dist_tensor: torch.Tensor,
         weights: same shape as input
     """
     return w_min + (1.0 - w_min) * torch.exp(-graph_dist_tensor / lambda_decay)
+
+
+# ============================================================================
+# Idea 1-B: Element-Aware Weighting
+# ============================================================================
+# Extends Idea 1-A by multiplying the graph-distance weight with a
+# per-element coefficient α_Z, reflecting that atoms of different elements
+# have different steric/electronic impact on TS geometry even at the same
+# graph distance.
+#
+# References:
+#   - Bondi, J. Phys. Chem. 1964, DOI: 10.1021/j100785a001 (vdW radii)
+#   - Pearson, Inorg. Chem. 1988, DOI: 10.1021/ic00281a023 (HSAB / polarizability)
+
+# 원소별 중요도 계수 α_Z
+# 근거: vdW 반지름과 분극율에 비례하도록 설정
+# H는 자유도가 높지만 TS 정확도 기여가 작으므로 감쇄
+# 할로겐은 분극율 순서대로 Br > Cl > F
+ELEMENT_IMPORTANCE = {
+    1:  0.5,   # H  — 회전 자유도 높고 TS 기여 낮음
+    6:  1.0,   # C  — 기준 원소
+    7:  1.1,   # N  — lone pair, 전기음성도
+    8:  1.1,   # O  — lone pair, 전기음성도
+    9:  1.2,   # F  — 높은 전기음성도, 작은 크기
+    16: 1.3,   # S  — 큰 원자, d-orbital 참여
+    17: 1.3,   # Cl — 중간 분극율 (Halo8에서 Cl은 Z=17)
+    35: 1.4,   # Br — 가장 큰 분극율, steric effect
+}
+
+# 주의: HALO_ATOM_MAPPING = {1: 0, 6: 1, 7: 2, 8: 3, 9: 4, 16: 5, 17: 6, 35: 7}
+# 이 매핑은 모델 입력용이고, weighting에서는 실제 원자번호(Z)를 사용
+
+
+def get_element_importance(atomic_number: int) -> float:
+    """원자번호로부터 중요도 계수를 반환한다."""
+    return ELEMENT_IMPORTANCE.get(int(atomic_number), 1.0)
+
+
+def compute_element_aware_weights(
+    graph_dist: np.ndarray,
+    atomic_numbers: np.ndarray,
+    w_min: float = 0.1,
+    lambda_decay: float = 2.0,
+    normalize: bool = True,
+    custom_alpha: Optional[dict] = None,
+) -> np.ndarray:
+    """
+    그래프 거리 + 원소별 계수를 결합한 가중치.
+
+    w_i = [w_min + (1 - w_min) * exp(-d_i / λ)] * α_{Z_i}
+
+    Args:
+        graph_dist: (N,) graph distances to core
+        atomic_numbers: (N,) atomic numbers
+        w_min: minimum weight
+        lambda_decay: decay length scale
+        normalize: True이면 평균으로 나누어 scale 통일
+        custom_alpha: 사용자 정의 α_Z (grid search 시 사용)
+
+    Returns:
+        weights: (N,) element-aware weights
+    """
+    # 1. 거리 기반 가중치 (Idea 1-A)
+    distance_weights = compute_continuous_weights(graph_dist, w_min, lambda_decay)
+
+    # 2. 원소별 계수
+    alpha_dict = custom_alpha if custom_alpha is not None else ELEMENT_IMPORTANCE
+    alpha = np.array(
+        [alpha_dict.get(int(z), 1.0) for z in atomic_numbers],
+        dtype=np.float64,
+    )
+
+    # 3. 결합
+    weights = distance_weights * alpha
+
+    # 4. 정규화: 분자 간 scale 통일
+    if normalize:
+        weights = weights / (weights.mean() + 1e-8)
+
+    return weights
+
+
+def compute_element_weights_for_batch(
+    pos_R: np.ndarray,
+    pos_P: np.ndarray,
+    atomic_numbers: np.ndarray,
+    w_min: float = 0.1,
+    lambda_decay: float = 2.0,
+    custom_alpha: Optional[dict] = None,
+) -> np.ndarray:
+    """
+    전체 파이프라인: 좌표 → core → 거리 → 원소 가중치.
+
+    Idea 1-A의 compute_weights_for_batch()를 대체한다.
+
+    Args:
+        pos_R: (N, 3) reactant positions
+        pos_P: (N, 3) product positions
+        atomic_numbers: (N,) atomic numbers
+        w_min: minimum weight
+        lambda_decay: decay length scale
+        custom_alpha: 사용자 정의 α_Z (grid search 시 사용)
+
+    Returns:
+        weights: (N,) element-aware continuous weights (normalized to mean ~1.0)
+    """
+    core = find_reactive_core_from_positions(pos_R, pos_P, atomic_numbers)
+    adj = build_adjacency_matrix(pos_R, atomic_numbers)
+    graph_dist = graph_distances_to_core(adj, core)
+    weights = compute_element_aware_weights(
+        graph_dist, atomic_numbers,
+        w_min=w_min, lambda_decay=lambda_decay,
+        normalize=True, custom_alpha=custom_alpha,
+    )
+    return weights

@@ -44,6 +44,8 @@ class ProcessedTS1x(BaseDataset):
         graph_weights_enabled: bool = True,
         graph_weights_w_min: float = 0.1,
         graph_weights_lambda: float = 2.0,
+        element_aware_weights: bool = False,
+        element_alpha: dict = None,
         **kwargs,
     ):
         super().__init__(
@@ -162,6 +164,9 @@ class ProcessedTS1x(BaseDataset):
 
         if graph_weights_enabled and not only_ts and not only_rp and not zero_charge:
             # Idea 1-A: graph-distance exponential-decay atom weights.
+            # Idea 1-B (when element_aware_weights=True): additionally multiply
+            # by per-element α_Z and normalize per-molecule so halogens /
+            # heteroatoms receive a larger share of the FM loss.
             # Requires R and P positions (indices 0 and 2 in standard layout)
             # plus atomic numbers in charge_{0}. Skip silently for data
             # layouts where these are absent (only_ts/only_rp) or when
@@ -170,4 +175,6 @@ class ProcessedTS1x(BaseDataset):
                 r_idx=0, p_idx=2, n_fragments=3,
                 w_min=graph_weights_w_min,
                 lambda_decay=graph_weights_lambda,
+                element_aware=element_aware_weights,
+                alpha_dict=element_alpha,
             )

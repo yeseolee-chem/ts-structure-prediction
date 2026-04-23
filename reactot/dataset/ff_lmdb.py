@@ -481,6 +481,8 @@ class ProcessedHalo8(Dataset):
         graph_weights_enabled: bool = True,
         graph_weights_w_min: float = 0.1,
         graph_weights_lambda: float = 2.0,
+        element_aware_weights: bool = False,
+        element_alpha: dict = None,
         **kwargs,
     ):
         super().__init__()
@@ -662,11 +664,16 @@ class ProcessedHalo8(Dataset):
 
         if graph_weights_enabled and not zero_charge:
             # Idea 1-A: graph-distance exponential-decay atom weights.
+            # Idea 1-B (when element_aware_weights=True): additionally multiply
+            # by per-element α_Z and normalize per-molecule. Halogen-specific
+            # enhancement — see reactot/utils/weighting.ELEMENT_IMPORTANCE.
             # R = fragment 0, P = fragment 2, atomic numbers in charge_0.
             self._attach_atom_weights(
                 r_idx=0, p_idx=2, n_fragments=3,
                 w_min=graph_weights_w_min,
                 lambda_decay=graph_weights_lambda,
+                element_aware=element_aware_weights,
+                alpha_dict=element_alpha,
             )
 
     def _attach_atom_weights(
@@ -676,13 +683,18 @@ class ProcessedHalo8(Dataset):
         n_fragments: int = 3,
         w_min: float = 0.1,
         lambda_decay: float = 2.0,
+        element_aware: bool = False,
+        alpha_dict: dict = None,
     ):
         """Same algorithm as BaseDataset.attach_atom_weights.
 
         Replicated here because ProcessedHalo8 does not inherit from
         BaseDataset but shares the same per-fragment data layout.
         """
-        from reactot.utils.weighting import compute_weights_for_batch
+        from reactot.utils.weighting import (
+            compute_weights_for_batch,
+            compute_element_weights_for_batch,
+        )
 
         pos_R_list = self.data[f"pos_{r_idx}"]
         pos_P_list = self.data[f"pos_{p_idx}"]
@@ -693,10 +705,17 @@ class ProcessedHalo8(Dataset):
             pos_R = pos_R_t.detach().cpu().numpy().astype(np.float64)
             pos_P = pos_P_t.detach().cpu().numpy().astype(np.float64)
             atomic_numbers = charge_t.detach().cpu().numpy().reshape(-1).astype(np.int64)
-            w = compute_weights_for_batch(
-                pos_R, pos_P, atomic_numbers,
-                w_min=w_min, lambda_decay=lambda_decay,
-            )
+            if element_aware:
+                w = compute_element_weights_for_batch(
+                    pos_R, pos_P, atomic_numbers,
+                    w_min=w_min, lambda_decay=lambda_decay,
+                    custom_alpha=alpha_dict,
+                )
+            else:
+                w = compute_weights_for_batch(
+                    pos_R, pos_P, atomic_numbers,
+                    w_min=w_min, lambda_decay=lambda_decay,
+                )
             weights_per_sample.append(
                 torch.tensor(w, dtype=torch.float32, device=self.device)
             )
