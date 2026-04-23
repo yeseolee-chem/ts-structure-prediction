@@ -481,6 +481,11 @@ class ProcessedHalo8(Dataset):
         graph_weights_enabled: bool = True,
         graph_weights_w_min: float = 0.1,
         graph_weights_lambda: float = 2.0,
+        # Idea 1-C: hierarchical 3-Tier + bond-angle correction
+        graph_weights_mode: str = "hierarchical",
+        graph_weights_beta_angle: float = 1.0,
+        graph_weights_interface_max_hop: int = 2,
+        graph_weights_normalize: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -661,12 +666,16 @@ class ProcessedHalo8(Dataset):
         ]
 
         if graph_weights_enabled and not zero_charge:
-            # Idea 1-A: graph-distance exponential-decay atom weights.
-            # R = fragment 0, P = fragment 2, atomic numbers in charge_0.
+            # Idea 1-A / 1-C: per-atom weights for FM loss. R = fragment 0,
+            # P = fragment 2, atomic numbers in charge_0.
             self._attach_atom_weights(
                 r_idx=0, p_idx=2, n_fragments=3,
                 w_min=graph_weights_w_min,
                 lambda_decay=graph_weights_lambda,
+                mode=graph_weights_mode,
+                beta_angle=graph_weights_beta_angle,
+                interface_max_hop=graph_weights_interface_max_hop,
+                normalize=graph_weights_normalize,
             )
 
     def _attach_atom_weights(
@@ -676,27 +685,50 @@ class ProcessedHalo8(Dataset):
         n_fragments: int = 3,
         w_min: float = 0.1,
         lambda_decay: float = 2.0,
+        mode: str = "hierarchical",
+        beta_angle: float = 1.0,
+        interface_max_hop: int = 2,
+        normalize: bool = True,
     ):
         """Same algorithm as BaseDataset.attach_atom_weights.
 
         Replicated here because ProcessedHalo8 does not inherit from
         BaseDataset but shares the same per-fragment data layout.
         """
-        from reactot.utils.weighting import compute_weights_for_batch
+        from reactot.utils.weighting import (
+            compute_weights_for_batch,
+            compute_hierarchical_weights_for_batch,
+        )
 
         pos_R_list = self.data[f"pos_{r_idx}"]
         pos_P_list = self.data[f"pos_{p_idx}"]
         charge_list = self.data[f"charge_{r_idx}"]
+
+        if mode not in ("flat", "hierarchical"):
+            raise ValueError(
+                f"_attach_atom_weights: mode must be 'flat' or 'hierarchical', "
+                f"got {mode!r}"
+            )
 
         weights_per_sample = []
         for pos_R_t, pos_P_t, charge_t in zip(pos_R_list, pos_P_list, charge_list):
             pos_R = pos_R_t.detach().cpu().numpy().astype(np.float64)
             pos_P = pos_P_t.detach().cpu().numpy().astype(np.float64)
             atomic_numbers = charge_t.detach().cpu().numpy().reshape(-1).astype(np.int64)
-            w = compute_weights_for_batch(
-                pos_R, pos_P, atomic_numbers,
-                w_min=w_min, lambda_decay=lambda_decay,
-            )
+            if mode == "hierarchical":
+                w = compute_hierarchical_weights_for_batch(
+                    pos_R, pos_P, atomic_numbers,
+                    w_min=w_min,
+                    lambda_decay=lambda_decay,
+                    beta_angle=beta_angle,
+                    interface_max_hop=interface_max_hop,
+                    normalize=normalize,
+                )
+            else:
+                w = compute_weights_for_batch(
+                    pos_R, pos_P, atomic_numbers,
+                    w_min=w_min, lambda_decay=lambda_decay,
+                )
             weights_per_sample.append(
                 torch.tensor(w, dtype=torch.float32, device=self.device)
             )

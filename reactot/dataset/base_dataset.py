@@ -6,7 +6,10 @@ from torch.utils.data import Dataset
 import torch.nn.functional as F
 
 from reactot.dataset.datasets_config import ATOM_MAPPING, SAM_CHARGED_ATOM_MAPPING
-from reactot.utils.weighting import compute_weights_for_batch
+from reactot.utils.weighting import (
+    compute_weights_for_batch,
+    compute_hierarchical_weights_for_batch,
+)
 
 
 class BaseDataset(Dataset):
@@ -94,20 +97,32 @@ class BaseDataset(Dataset):
         n_fragments: int = 3,
         w_min: float = 0.1,
         lambda_decay: float = 2.0,
+        mode: str = "hierarchical",
+        beta_angle: float = 1.0,
+        interface_max_hop: int = 2,
+        normalize: bool = True,
     ):
-        """Precompute graph-distance-based continuous atom weights per sample.
+        """Precompute per-sample atom weights.
 
-        Uses the already-processed ``pos_{r_idx}`` and ``pos_{p_idx}`` tensors
-        plus the ``charge_{r_idx}`` field (atomic numbers) to build one
-        ``atom_weights_{idx}`` list per fragment — the same weights are
-        replicated across fragments because R/TS/P share atom order.
+        Two modes:
+
+        - ``mode="flat"`` (Idea 1-A): graph-distance exponential decay only.
+        - ``mode="hierarchical"`` (Idea 1-C): 3-Tier (Core/Interface/Peripheral)
+          with interface atoms corrected by R→P bond-angle change.
+
+        The same weight vector is replicated across all fragments because
+        R/TS/P share atom ordering.
 
         Args:
             r_idx: fragment index for reactant positions.
             p_idx: fragment index for product positions.
             n_fragments: number of fragments to replicate weights across.
-            w_min: minimum weight at graph-infinity (Idea 1-A default 0.1).
-            lambda_decay: decay length in hop units (Idea 1-A default 2.0).
+            w_min: peripheral / graph-infinity weight.
+            lambda_decay: decay length in hop units.
+            mode: "flat" (Idea 1-A) or "hierarchical" (Idea 1-C).
+            beta_angle: Idea 1-C — interface bond-angle correction strength.
+            interface_max_hop: Idea 1-C — max graph distance counted as Interface.
+            normalize: Idea 1-C — per-molecule mean-normalize the weights.
         """
         pos_R_list = self.data[f"pos_{r_idx}"]
         pos_P_list = self.data[f"pos_{p_idx}"]
@@ -118,15 +133,31 @@ class BaseDataset(Dataset):
             )
         charge_list = self.data[f"charge_{r_idx}"]
 
+        if mode not in ("flat", "hierarchical"):
+            raise ValueError(
+                f"attach_atom_weights: mode must be 'flat' or 'hierarchical', "
+                f"got {mode!r}"
+            )
+
         weights_per_sample = []
         for pos_R_t, pos_P_t, charge_t in zip(pos_R_list, pos_P_list, charge_list):
             pos_R = pos_R_t.detach().cpu().numpy().astype(np.float64)
             pos_P = pos_P_t.detach().cpu().numpy().astype(np.float64)
             atomic_numbers = charge_t.detach().cpu().numpy().reshape(-1).astype(np.int64)
-            w = compute_weights_for_batch(
-                pos_R, pos_P, atomic_numbers,
-                w_min=w_min, lambda_decay=lambda_decay,
-            )
+            if mode == "hierarchical":
+                w = compute_hierarchical_weights_for_batch(
+                    pos_R, pos_P, atomic_numbers,
+                    w_min=w_min,
+                    lambda_decay=lambda_decay,
+                    beta_angle=beta_angle,
+                    interface_max_hop=interface_max_hop,
+                    normalize=normalize,
+                )
+            else:
+                w = compute_weights_for_batch(
+                    pos_R, pos_P, atomic_numbers,
+                    w_min=w_min, lambda_decay=lambda_decay,
+                )
             weights_per_sample.append(
                 torch.tensor(w, dtype=torch.float32, device=self.device)
             )

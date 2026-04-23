@@ -44,6 +44,11 @@ class ProcessedTS1x(BaseDataset):
         graph_weights_enabled: bool = True,
         graph_weights_w_min: float = 0.1,
         graph_weights_lambda: float = 2.0,
+        # Idea 1-C: hierarchical 3-Tier + bond-angle correction
+        graph_weights_mode: str = "hierarchical",
+        graph_weights_beta_angle: float = 1.0,
+        graph_weights_interface_max_hop: int = 2,
+        graph_weights_normalize: bool = True,
         **kwargs,
     ):
         super().__init__(
@@ -161,13 +166,17 @@ class ProcessedTS1x(BaseDataset):
             ]
 
         if graph_weights_enabled and not only_ts and not only_rp and not zero_charge:
-            # Idea 1-A: graph-distance exponential-decay atom weights.
-            # Requires R and P positions (indices 0 and 2 in standard layout)
-            # plus atomic numbers in charge_{0}. Skip silently for data
-            # layouts where these are absent (only_ts/only_rp) or when
-            # atomic numbers are zeroed out (zero_charge).
+            # Idea 1-A / 1-C: per-atom weights for FM loss. Requires R and P
+            # positions (indices 0 and 2 in standard layout) plus atomic
+            # numbers in charge_{0}. Skip silently for data layouts where
+            # these are absent (only_ts/only_rp) or when atomic numbers are
+            # zeroed out (zero_charge).
             self.attach_atom_weights(
                 r_idx=0, p_idx=2, n_fragments=3,
                 w_min=graph_weights_w_min,
                 lambda_decay=graph_weights_lambda,
+                mode=graph_weights_mode,
+                beta_angle=graph_weights_beta_angle,
+                interface_max_hop=graph_weights_interface_max_hop,
+                normalize=graph_weights_normalize,
             )
