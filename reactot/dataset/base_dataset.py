@@ -6,6 +6,7 @@ from torch.utils.data import Dataset
 import torch.nn.functional as F
 
 from reactot.dataset.datasets_config import ATOM_MAPPING, SAM_CHARGED_ATOM_MAPPING
+from reactot.utils.weighting import compute_weights_for_batch
 
 
 class BaseDataset(Dataset):
@@ -85,6 +86,44 @@ class BaseDataset(Dataset):
         if len(list(res.keys())) == 1:
             return out, res["condition"]
         return out, res
+
+    def attach_atom_weights(
+        self,
+        r_idx: int = 0,
+        p_idx: int = 2,
+        n_fragments: int = 3,
+        w_min: float = 0.1,
+        lambda_decay: float = 2.0,
+    ):
+        """Precompute graph-distance-based continuous atom weights per sample.
+
+        Used as the Idea 1-D *prior* — the importance head learns weights
+        that get KL-regularized toward these fixed per-atom priors.
+        """
+        pos_R_list = self.data[f"pos_{r_idx}"]
+        pos_P_list = self.data[f"pos_{p_idx}"]
+        if self.zero_charge:
+            raise ValueError(
+                "attach_atom_weights requires non-zero charge_ tensors for "
+                "atomic numbers; run before zero_charge or provide charges."
+            )
+        charge_list = self.data[f"charge_{r_idx}"]
+
+        weights_per_sample = []
+        for pos_R_t, pos_P_t, charge_t in zip(pos_R_list, pos_P_list, charge_list):
+            pos_R = pos_R_t.detach().cpu().numpy().astype(np.float64)
+            pos_P = pos_P_t.detach().cpu().numpy().astype(np.float64)
+            atomic_numbers = charge_t.detach().cpu().numpy().reshape(-1).astype(np.int64)
+            w = compute_weights_for_batch(
+                pos_R, pos_P, atomic_numbers,
+                w_min=w_min, lambda_decay=lambda_decay,
+            )
+            weights_per_sample.append(
+                torch.tensor(w, dtype=torch.float32, device=self.device)
+            )
+
+        for idx in range(n_fragments):
+            self.data[f"atom_weights_{idx}"] = weights_per_sample
 
     def patch_dummy_molecules(self, idx):
         self.data[f"size_{idx}"] = torch.ones_like(

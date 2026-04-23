@@ -478,6 +478,9 @@ class ProcessedHalo8(Dataset):
         prefix="Halogen",
         seed=None,
         max_db_files=None,
+        graph_weights_enabled: bool = True,
+        graph_weights_w_min: float = 0.1,
+        graph_weights_lambda: float = 2.0,
         **kwargs,
     ):
         super().__init__()
@@ -656,6 +659,50 @@ class ProcessedHalo8(Dataset):
             torch.zeros(size=(1, 1), dtype=torch.int64, device=self.device)
             for _ in range(self.n_samples)
         ]
+
+        if graph_weights_enabled and not zero_charge:
+            # Idea 1-D prior: graph-distance exponential-decay atom weights.
+            # R = fragment 0, P = fragment 2, atomic numbers in charge_0.
+            self._attach_atom_weights(
+                r_idx=0, p_idx=2, n_fragments=3,
+                w_min=graph_weights_w_min,
+                lambda_decay=graph_weights_lambda,
+            )
+
+    def _attach_atom_weights(
+        self,
+        r_idx: int = 0,
+        p_idx: int = 2,
+        n_fragments: int = 3,
+        w_min: float = 0.1,
+        lambda_decay: float = 2.0,
+    ):
+        """Same algorithm as BaseDataset.attach_atom_weights.
+
+        Replicated here because ProcessedHalo8 does not inherit from
+        BaseDataset but shares the same per-fragment data layout.
+        """
+        from reactot.utils.weighting import compute_weights_for_batch
+
+        pos_R_list = self.data[f"pos_{r_idx}"]
+        pos_P_list = self.data[f"pos_{p_idx}"]
+        charge_list = self.data[f"charge_{r_idx}"]
+
+        weights_per_sample = []
+        for pos_R_t, pos_P_t, charge_t in zip(pos_R_list, pos_P_list, charge_list):
+            pos_R = pos_R_t.detach().cpu().numpy().astype(np.float64)
+            pos_P = pos_P_t.detach().cpu().numpy().astype(np.float64)
+            atomic_numbers = charge_t.detach().cpu().numpy().reshape(-1).astype(np.int64)
+            w = compute_weights_for_batch(
+                pos_R, pos_P, atomic_numbers,
+                w_min=w_min, lambda_decay=lambda_decay,
+            )
+            weights_per_sample.append(
+                torch.tensor(w, dtype=torch.float32, device=self.device)
+            )
+
+        for idx in range(n_fragments):
+            self.data[f"atom_weights_{idx}"] = weights_per_sample
 
     def __len__(self):
         return self.n_samples

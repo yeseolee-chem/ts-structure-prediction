@@ -78,6 +78,9 @@ class SBModule(LightningModule):
         ts_guess: bool = False,
         idx: int = 1,
         pbc: bool = False,
+        learn_importance: bool = False,
+        kl_weight: float = 0.1,
+        learned_w_min: float = 0.1,
     ) -> None:
         super().__init__()
         egnn_dynamics = EGNNDynamics(
@@ -93,6 +96,7 @@ class SBModule(LightningModule):
             model=model,
             enforce_same_encoding=enforce_same_encoding,
             source=source,
+            learn_importance=learn_importance,
         )
 
         normalizer = Normalizer(
@@ -121,7 +125,10 @@ class SBModule(LightningModule):
             sigma=sigma,
             ts_guess=ts_guess,
             idx=idx,
+            kl_weight=kl_weight,
+            learned_w_min=learned_w_min,
         )
+        self.learn_importance = learn_importance
         self.model_config = model_config
         self.optimizer_config = optimizer_config
         self.training_config = training_config
@@ -318,15 +325,25 @@ class SBModule(LightningModule):
 
     def compute_loss(self, batch):
         representations, conditions = batch
+        # Idea 1-D: pass the graph-distance prior through so en_sb.py can KL-
+        # regularize the learned importance against it (or use it directly as
+        # fixed weights when learn_importance=False).
+        target_rep = representations[self.ddpm.idx]
+        atom_weights_prior = target_rep.get("atom_weights", None)
         loss_terms = self.ddpm.forward(
             representations,
             conditions,
             ot_ode=self.ot_ode,
+            atom_weights_prior=atom_weights_prior,
         )
         info = {
             "loss": loss_terms["loss"],
             "scaled_err": loss_terms["scaled_err"],
         }
+        if "loss_fm" in loss_terms:
+            info["loss_fm"] = loss_terms["loss_fm"]
+        if "loss_kl" in loss_terms:
+            info["loss_kl"] = loss_terms["loss_kl"]
         return info
 
     @torch.no_grad()

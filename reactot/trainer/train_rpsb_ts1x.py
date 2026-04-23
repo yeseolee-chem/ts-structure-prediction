@@ -236,6 +236,12 @@ def main(argv=None):
     sigma: float = 0.0
     ts_guess = None
 
+    # Idea 1-D: learnable per-atom importance with KL-to-prior regularization.
+    # Defaults to enabled on this branch; tune via LEARN_IMPORTANCE/KL_WEIGHT env.
+    learn_importance: bool = os.environ.get("LEARN_IMPORTANCE", "1") != "0"
+    kl_weight: float = float(os.environ.get("KL_WEIGHT", "0.1"))
+    learned_w_min: float = float(os.environ.get("LEARNED_W_MIN", "0.1"))
+
     run_name = f"{cfgs['model_type']}-{cfgs['version']}-" + str(uuid4()).split("-")[-1]
 
     opt = OPT(solver="ddpm", method="midpoint")
@@ -276,6 +282,9 @@ def main(argv=None):
         inv_power=inv_power,
         sigma=sigma,
         ts_guess=ts_guess,
+        learn_importance=learn_importance,
+        kl_weight=kl_weight,
+        learned_w_min=learned_w_min,
     )
     ddpm.ddpm.opt = opt
 

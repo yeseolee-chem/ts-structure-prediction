@@ -4,3 +4,12 @@ from ._graph_tools import (
     get_n_frag_switch,
     get_mask_for_frag,
 )
+from .weighting import (
+    compute_weights_for_batch,
+    compute_weights_torch,
+    find_reactive_core_from_positions,
+    find_reactive_core_from_smiles,
+    graph_distances_to_core,
+    build_adjacency_matrix,
+    compute_continuous_weights,
+)

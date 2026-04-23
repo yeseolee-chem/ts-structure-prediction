@@ -41,6 +41,9 @@ class ProcessedTS1x(BaseDataset):
         ts_guess=False,
         react_type=None,
         atom_mapping=ATOM_MAPPING,
+        graph_weights_enabled: bool = True,
+        graph_weights_w_min: float = 0.1,
+        graph_weights_lambda: float = 2.0,
         **kwargs,
     ):
         super().__init__(
@@ -156,3 +159,12 @@ class ProcessedTS1x(BaseDataset):
                 torch.zeros(size=(1, 1), dtype=torch.int64, device=self.device,)
                 for _ in range(self.n_samples)
             ]
+
+        if graph_weights_enabled and not only_ts and not only_rp and not zero_charge:
+            # Idea 1-D prior: graph-distance exponential-decay atom weights.
+            # Used as KL regularization target for the learned importance head.
+            self.attach_atom_weights(
+                r_idx=0, p_idx=2, n_fragments=3,
+                w_min=graph_weights_w_min,
+                lambda_decay=graph_weights_lambda,
+            )
