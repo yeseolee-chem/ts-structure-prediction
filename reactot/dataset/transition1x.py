@@ -46,6 +46,9 @@ class ProcessedTS1x(BaseDataset):
         graph_weights_lambda: float = 2.0,
         element_aware_weights: bool = False,
         element_alpha: dict = None,
+        weighting_scheme: str = "AB",
+        graph_weights_interface_max_hop: int = 2,
+        graph_weights_beta_angle: float = 1.0,
         **kwargs,
     ):
         super().__init__(
@@ -177,4 +180,7 @@ class ProcessedTS1x(BaseDataset):
                 lambda_decay=graph_weights_lambda,
                 element_aware=element_aware_weights,
                 alpha_dict=element_alpha,
+                weighting_scheme=weighting_scheme,
+                interface_max_hop=graph_weights_interface_max_hop,
+                beta_angle=graph_weights_beta_angle,
             )

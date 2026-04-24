@@ -483,6 +483,9 @@ class ProcessedHalo8(Dataset):
         graph_weights_lambda: float = 2.0,
         element_aware_weights: bool = False,
         element_alpha: dict = None,
+        weighting_scheme: str = "AB",
+        graph_weights_interface_max_hop: int = 2,
+        graph_weights_beta_angle: float = 1.0,
         **kwargs,
     ):
         super().__init__()
@@ -674,6 +677,9 @@ class ProcessedHalo8(Dataset):
                 lambda_decay=graph_weights_lambda,
                 element_aware=element_aware_weights,
                 alpha_dict=element_alpha,
+                weighting_scheme=weighting_scheme,
+                interface_max_hop=graph_weights_interface_max_hop,
+                beta_angle=graph_weights_beta_angle,
             )
 
     def _attach_atom_weights(
@@ -685,16 +691,28 @@ class ProcessedHalo8(Dataset):
         lambda_decay: float = 2.0,
         element_aware: bool = False,
         alpha_dict: dict = None,
+        weighting_scheme: str = "AB",
+        interface_max_hop: int = 2,
+        beta_angle: float = 1.0,
     ):
         """Same algorithm as BaseDataset.attach_atom_weights.
 
         Replicated here because ProcessedHalo8 does not inherit from
         BaseDataset but shares the same per-fragment data layout.
+
+        weighting_scheme="BC" routes through compute_bc_weights (3-tier × α_Z).
         """
         from reactot.utils.weighting import (
             compute_weights_for_batch,
             compute_hybrid_weights,
+            compute_bc_weights,
         )
+
+        if weighting_scheme not in ("AB", "BC"):
+            raise ValueError(
+                f"Unknown weighting_scheme: {weighting_scheme!r}. "
+                "Expected 'AB' or 'BC'."
+            )
 
         pos_R_list = self.data[f"pos_{r_idx}"]
         pos_P_list = self.data[f"pos_{p_idx}"]
@@ -705,7 +723,16 @@ class ProcessedHalo8(Dataset):
             pos_R = pos_R_t.detach().cpu().numpy().astype(np.float64)
             pos_P = pos_P_t.detach().cpu().numpy().astype(np.float64)
             atomic_numbers = charge_t.detach().cpu().numpy().reshape(-1).astype(np.int64)
-            if element_aware:
+            if weighting_scheme == "BC":
+                # Idea 1-BC: 3-tier × α_Z. A is used inside C — not re-applied.
+                w = compute_bc_weights(
+                    pos_R, pos_P, atomic_numbers,
+                    w_min=w_min, lambda_decay=lambda_decay,
+                    interface_max_hop=interface_max_hop,
+                    beta_angle=beta_angle,
+                    element_alpha=alpha_dict, normalize=True,
+                )
+            elif element_aware:
                 # Idea 1-AB hybrid: graph-distance × α_Z, per-molecule mean=1
                 w = compute_hybrid_weights(
                     pos_R, pos_P, atomic_numbers,

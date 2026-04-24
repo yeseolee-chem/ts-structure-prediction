@@ -495,3 +495,280 @@ def compute_hybrid_weights_batch_torch(
     if not chunks:
         return torch.zeros(0, dtype=torch.float32, device=device)
     return torch.cat(chunks).to(device)
+
+
+# ============================================================================
+# Idea 1-C: 3-Tier Hierarchical Weighting + Bond-angle correction
+# ============================================================================
+# Reference:
+# - FragmentFlow (2025): KL divergence 분해로 core/attachment 오류 분리
+# - ASM (Vermeeren et al., Nat. Protoc., 2020; DOI: 10.1038/s41596-019-0265-0):
+#   interface 원자의 결합각 변화 → strain 기여
+
+
+def classify_atoms_3tier(graph_dist: np.ndarray,
+                          interface_max_hop: int = 2) -> np.ndarray:
+    """
+    원자를 3개 계층으로 분류한다.
+
+    - Tier 1 (Core): graph_dist == 0 → 결합 변화에 직접 관여
+    - Tier 2 (Interface): 0 < graph_dist <= interface_max_hop → core 인접
+    - Tier 3 (Peripheral): graph_dist > interface_max_hop → 먼 치환기
+    """
+    tier = np.full(graph_dist.shape, 3, dtype=int)
+    tier[graph_dist == 0] = 1
+    tier[(graph_dist > 0) & (graph_dist <= interface_max_hop)] = 2
+    return tier
+
+
+def compute_bond_angle_changes(pos_R: np.ndarray, pos_P: np.ndarray,
+                                adj_matrix: np.ndarray) -> np.ndarray:
+    """
+    각 원자에 대해, 해당 원자를 꼭짓점으로 하는 모든 결합각의
+    R→P 최대 변화량(degree)을 계산한다.
+    """
+    N = pos_R.shape[0]
+    max_angle_change = np.zeros(N)
+
+    for i in range(N):
+        neighbors = np.where(adj_matrix[i] == 1)[0]
+        if len(neighbors) < 2:
+            continue
+
+        max_delta = 0.0
+        for k_idx in range(len(neighbors)):
+            for l_idx in range(k_idx + 1, len(neighbors)):
+                j = neighbors[k_idx]
+                k = neighbors[l_idx]
+
+                v1_R = pos_R[j] - pos_R[i]
+                v2_R = pos_R[k] - pos_R[i]
+                cos_R = np.dot(v1_R, v2_R) / (
+                    np.linalg.norm(v1_R) * np.linalg.norm(v2_R) + 1e-10)
+                angle_R = np.degrees(np.arccos(np.clip(cos_R, -1, 1)))
+
+                v1_P = pos_P[j] - pos_P[i]
+                v2_P = pos_P[k] - pos_P[i]
+                cos_P = np.dot(v1_P, v2_P) / (
+                    np.linalg.norm(v1_P) * np.linalg.norm(v2_P) + 1e-10)
+                angle_P = np.degrees(np.arccos(np.clip(cos_P, -1, 1)))
+
+                delta = abs(angle_R - angle_P)
+                max_delta = max(max_delta, delta)
+
+        max_angle_change[i] = max_delta
+
+    return max_angle_change
+
+
+def compute_hierarchical_weights(
+    pos_R: np.ndarray,
+    pos_P: np.ndarray,
+    atomic_numbers: np.ndarray,
+    w_min: float = 0.1,
+    lambda_decay: float = 2.0,
+    beta_angle: float = 1.0,
+    interface_max_hop: int = 2,
+    normalize: bool = True,
+) -> np.ndarray:
+    """
+    3-Tier 계층적 가중치 + Interface 결합각 보정 (Idea 1-C).
+
+    - Core (Tier 1): w = 1.0
+    - Interface (Tier 2): w = w_distance * (1 + β * |Δθ_max| / 180°)
+    - Peripheral (Tier 3): w = w_min
+    """
+    core = find_reactive_core_from_positions(pos_R, pos_P, atomic_numbers)
+    adj = build_adjacency_matrix(pos_R, atomic_numbers)
+    graph_dist = graph_distances_to_core(adj, core)
+
+    if len(core) == 0:
+        tier = np.full(graph_dist.shape, 2, dtype=int)
+    else:
+        tier = classify_atoms_3tier(graph_dist, interface_max_hop)
+
+    distance_weights = compute_continuous_weights(graph_dist, w_min, lambda_decay)
+    angle_changes = compute_bond_angle_changes(pos_R, pos_P, adj)
+
+    N = len(atomic_numbers)
+    weights = np.zeros(N)
+    for i in range(N):
+        if tier[i] == 1:
+            weights[i] = 1.0
+        elif tier[i] == 2:
+            angle_factor = 1.0 + beta_angle * (angle_changes[i] / 180.0)
+            weights[i] = distance_weights[i] * angle_factor
+        else:
+            weights[i] = w_min
+
+    if normalize:
+        weights = weights / (weights.mean() + 1e-8)
+    return weights
+
+
+# ============================================================================
+# Idea 1-BC: Tier-Aware × Element-Aware Weighting
+# ============================================================================
+# B (element-aware α_Z) × C (3-tier + bond-angle) hybrid. A is already used
+# inside C — do NOT multiply A again.
+#
+# Formula:
+#   Core (tier=1):       w_i = 1.0 * α_{Z_i}
+#   Interface (tier=2):  w_i = w_dist(d_i) * angle_factor(Δθ_i) * α_{Z_i}
+#   Peripheral (tier=3): w_i = w_min * α_{Z_i}
+#
+# References:
+#   - Bondi vdW radii (J. Phys. Chem. 1964, DOI: 10.1021/j100785a001)
+#   - Pearson HSAB (Inorg. Chem. 1988, DOI: 10.1021/ic00281a023)
+#   - ASM (Vermeeren et al., Nat. Protoc. 2020, DOI: 10.1038/s41596-019-0265-0)
+
+
+def compute_bc_weights(
+    pos_R: np.ndarray,
+    pos_P: np.ndarray,
+    atomic_numbers: np.ndarray,
+    w_min: float = 0.1,
+    lambda_decay: float = 2.0,
+    interface_max_hop: int = 2,
+    beta_angle: float = 1.0,
+    element_alpha: Optional[dict] = None,
+    normalize: bool = True,
+    return_metadata: bool = False,
+):
+    """
+    Tier 분류(C) × 원소 계수(B) 결합 가중치.
+
+        Core:       w_i = 1.0 * α_{Z_i}
+        Interface:  w_i = w_dist(d_i) * (1 + β * |Δθ_i|/180°) * α_{Z_i}
+        Peripheral: w_i = w_min * α_{Z_i}
+
+    Args:
+        pos_R: (N, 3) reactant positions
+        pos_P: (N, 3) product positions
+        atomic_numbers: (N,) atomic numbers
+        w_min: minimum (peripheral) base weight
+        lambda_decay: exponential decay scale for interface (hops)
+        interface_max_hop: tier-2 maximum hop distance
+        beta_angle: bond-angle correction strength (0 → C without angle)
+        element_alpha: per-element α_Z dict (None → DEFAULT_ELEMENT_ALPHA)
+        normalize: per-molecule normalization (mean → 1.0)
+        return_metadata: if True, return (weights, metadata_dict)
+
+    Returns:
+        weights: (N,) BC weights
+        metadata (optional): debug dict with tier, alpha, base_weights, etc.
+    """
+    alpha_dict = element_alpha if element_alpha is not None else DEFAULT_ELEMENT_ALPHA
+
+    # 1. Reactive core
+    core = find_reactive_core_from_positions(pos_R, pos_P, atomic_numbers)
+
+    # 2. Adjacency & graph distances
+    adj = build_adjacency_matrix(pos_R, atomic_numbers)
+    graph_dist = graph_distances_to_core(adj, core)
+
+    # 3. C: 3-Tier (fallback to all-Interface when core is empty)
+    if len(core) == 0:
+        tier = np.full(graph_dist.shape, 2, dtype=int)
+    else:
+        tier = classify_atoms_3tier(graph_dist, interface_max_hop)
+
+    # 4. C: distance & bond-angle (interface only)
+    distance_weights = compute_continuous_weights(graph_dist, w_min, lambda_decay)
+    angle_changes = compute_bond_angle_changes(pos_R, pos_P, adj)
+
+    # 5. B: per-element α_Z
+    alpha = np.array(
+        [alpha_dict.get(int(z), 1.0) for z in atomic_numbers],
+        dtype=np.float64,
+    )
+
+    # 6. Tier-wise base weight (C logic)
+    N = len(atomic_numbers)
+    base_weights = np.zeros(N)
+    for i in range(N):
+        if tier[i] == 1:
+            base_weights[i] = 1.0
+        elif tier[i] == 2:
+            angle_factor = 1.0 + beta_angle * (angle_changes[i] / 180.0)
+            base_weights[i] = distance_weights[i] * angle_factor
+        else:
+            base_weights[i] = w_min
+
+    # 7. B: multiply by α_Z
+    weights_raw = base_weights * alpha
+    weights = weights_raw.copy()
+
+    # 8. Normalize
+    if normalize and weights.mean() > 1e-8:
+        weights = weights / weights.mean()
+
+    if return_metadata:
+        metadata = {
+            "core_atoms": sorted(int(i) for i in core),
+            "graph_dist": graph_dist,
+            "tier": tier,
+            "distance_weights": distance_weights,
+            "angle_changes": angle_changes,
+            "alpha": alpha,
+            "base_weights": base_weights,
+            "weights_raw": weights_raw,
+        }
+        return weights, metadata
+
+    return weights
+
+
+def compute_bc_weights_for_batch(
+    pos_R: np.ndarray,
+    pos_P: np.ndarray,
+    atomic_numbers: np.ndarray,
+    **kwargs,
+) -> np.ndarray:
+    """
+    전체 파이프라인 래퍼. compute_hybrid_weights와 동일 시그니처(반환값,
+    normalize 동작)이므로 dataset/trainer는 weighting_scheme 변수만 바꾸면
+    즉시 교체 가능.
+    """
+    return compute_bc_weights(pos_R, pos_P, atomic_numbers, **kwargs)
+
+
+def compute_bc_weights_batch_torch(
+    pos_R_batch: torch.Tensor,
+    pos_P_batch: torch.Tensor,
+    atomic_numbers_batch: torch.Tensor,
+    batch_mask: torch.Tensor,
+    w_min: float = 0.1,
+    lambda_decay: float = 2.0,
+    interface_max_hop: int = 2,
+    beta_angle: float = 1.0,
+    element_alpha: Optional[dict] = None,
+) -> torch.Tensor:
+    """배치 내 모든 분자에 대해 BC 가중치를 계산 (compute_hybrid_weights_batch_torch와 동일 패턴)."""
+    device = pos_R_batch.device
+    n_molecules = int(batch_mask.max().item()) + 1 if batch_mask.numel() else 0
+
+    chunks = []
+    for mol_idx in range(n_molecules):
+        mask = batch_mask == mol_idx
+        pos_R = pos_R_batch[mask].detach().cpu().numpy().astype(np.float64)
+        pos_P = pos_P_batch[mask].detach().cpu().numpy().astype(np.float64)
+        z = (
+            atomic_numbers_batch[mask]
+            .detach()
+            .cpu()
+            .numpy()
+            .reshape(-1)
+            .astype(np.int64)
+        )
+        w = compute_bc_weights(
+            pos_R, pos_P, z,
+            w_min=w_min, lambda_decay=lambda_decay,
+            interface_max_hop=interface_max_hop, beta_angle=beta_angle,
+            element_alpha=element_alpha, normalize=True,
+        )
+        chunks.append(torch.tensor(w, dtype=torch.float32))
+
+    if not chunks:
+        return torch.zeros(0, dtype=torch.float32, device=device)
+    return torch.cat(chunks).to(device)

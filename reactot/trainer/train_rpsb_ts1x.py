@@ -120,6 +120,29 @@ def parse_args(argv=None):
         default=None,
         help="Override λ (graph-distance decay length; default 2.0).",
     )
+    # Idea 1-BC: 3-tier × α_Z (B+C). Switches the weighting kernel from
+    # AB hybrid (default) to BC. Element-aware α_Z is always on for BC.
+    p.add_argument(
+        "--weighting-scheme",
+        choices=["AB", "BC"],
+        default="AB",
+        help="Per-atom FM-loss weighting kernel. 'AB' (default) = "
+        "graph-distance × α_Z hybrid. 'BC' = 3-tier × α_Z + bond-angle "
+        "(Idea 1-BC).",
+    )
+    p.add_argument(
+        "--interface-max-hop",
+        type=int,
+        default=None,
+        help="BC only: tier-2 (Interface) maximum hop distance. Default 2.",
+    )
+    p.add_argument(
+        "--beta-angle",
+        type=float,
+        default=None,
+        help="BC only: bond-angle correction strength (0 → C without angle). "
+        "Default 1.0.",
+    )
     args = p.parse_args(argv)
 
     if args.data_dir is None:
@@ -240,6 +263,13 @@ def build_configs(args):
         ),
         element_aware_weights=bool(args.element_aware_weights),
         element_alpha=element_alpha,
+        weighting_scheme=args.weighting_scheme,
+        graph_weights_interface_max_hop=(
+            args.interface_max_hop if args.interface_max_hop is not None else 2
+        ),
+        graph_weights_beta_angle=(
+            args.beta_angle if args.beta_angle is not None else 1.0
+        ),
     )
     if args.dataset == "Halo8":
         training_config["data_limit"] = args.data_limit

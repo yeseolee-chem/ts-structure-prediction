@@ -19,4 +19,10 @@ from .weighting import (
     DEFAULT_ELEMENT_ALPHA,
     compute_hybrid_weights,
     compute_hybrid_weights_batch_torch,
+    classify_atoms_3tier,
+    compute_bond_angle_changes,
+    compute_hierarchical_weights,
+    compute_bc_weights,
+    compute_bc_weights_for_batch,
+    compute_bc_weights_batch_torch,
 )

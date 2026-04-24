@@ -10,6 +10,7 @@ from reactot.utils.weighting import (
     compute_weights_for_batch,
     compute_element_weights_for_batch,
     compute_hybrid_weights,
+    compute_bc_weights,
 )
 
 
@@ -100,13 +101,11 @@ class BaseDataset(Dataset):
         lambda_decay: float = 2.0,
         element_aware: bool = False,
         alpha_dict: dict = None,
+        weighting_scheme: str = "AB",
+        interface_max_hop: int = 2,
+        beta_angle: float = 1.0,
     ):
         """Precompute graph-distance-based continuous atom weights per sample.
-
-        Uses the already-processed ``pos_{r_idx}`` and ``pos_{p_idx}`` tensors
-        plus the ``charge_{r_idx}`` field (atomic numbers) to build one
-        ``atom_weights_{idx}`` list per fragment — the same weights are
-        replicated across fragments because R/TS/P share atom order.
 
         Args:
             r_idx: fragment index for reactant positions.
@@ -115,8 +114,12 @@ class BaseDataset(Dataset):
             w_min: minimum weight at graph-infinity (Idea 1-A default 0.1).
             lambda_decay: decay length in hop units (Idea 1-A default 2.0).
             element_aware: Idea 1-B — multiply by α_Z and normalize per-molecule.
-            alpha_dict: custom per-element α_Z (only used if element_aware).
-                When None, uses ELEMENT_IMPORTANCE defaults.
+            alpha_dict: custom per-element α_Z. When None, uses defaults.
+            weighting_scheme: "AB" (default) for graph-distance × α_Z hybrid,
+                or "BC" for 3-tier × α_Z (B+C). When "BC", `element_aware` is
+                ignored — α_Z is always applied.
+            interface_max_hop: BC only — tier-2 max hop (default 2).
+            beta_angle: BC only — bond-angle correction strength (default 1.0).
         """
         pos_R_list = self.data[f"pos_{r_idx}"]
         pos_P_list = self.data[f"pos_{p_idx}"]
@@ -127,12 +130,27 @@ class BaseDataset(Dataset):
             )
         charge_list = self.data[f"charge_{r_idx}"]
 
+        if weighting_scheme not in ("AB", "BC"):
+            raise ValueError(
+                f"Unknown weighting_scheme: {weighting_scheme!r}. "
+                "Expected 'AB' or 'BC'."
+            )
+
         weights_per_sample = []
         for pos_R_t, pos_P_t, charge_t in zip(pos_R_list, pos_P_list, charge_list):
             pos_R = pos_R_t.detach().cpu().numpy().astype(np.float64)
             pos_P = pos_P_t.detach().cpu().numpy().astype(np.float64)
             atomic_numbers = charge_t.detach().cpu().numpy().reshape(-1).astype(np.int64)
-            if element_aware:
+            if weighting_scheme == "BC":
+                # Idea 1-BC: 3-tier × α_Z (B+C). A is used inside C — not re-applied.
+                w = compute_bc_weights(
+                    pos_R, pos_P, atomic_numbers,
+                    w_min=w_min, lambda_decay=lambda_decay,
+                    interface_max_hop=interface_max_hop,
+                    beta_angle=beta_angle,
+                    element_alpha=alpha_dict, normalize=True,
+                )
+            elif element_aware:
                 # Idea 1-AB hybrid: graph-distance × α_Z, per-molecule mean=1
                 w = compute_hybrid_weights(
                     pos_R, pos_P, atomic_numbers,
