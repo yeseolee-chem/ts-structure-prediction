@@ -48,6 +48,8 @@ class EnSB(nn.Module):
         sigma: float = 0.0,
         ts_guess: bool = False,
         idx: int = 1,
+        kl_weight: float = 0.1,
+        learned_w_min: float = 0.1,
     ):
         super().__init__()
         assert loss_type in {"vlb", "l2"}
@@ -59,6 +61,10 @@ class EnSB(nn.Module):
         self.loss_type = loss_type
         self.pos_only = pos_only
         self.fixed_idx = fixed_idx or []
+        # Idea 1-D hyperparameters. These are only consulted when the
+        # EGNNDynamics was built with ``learn_importance=True``.
+        self.kl_weight = kl_weight
+        self.learned_w_min = learned_w_min
 
         self.pos_dim = dynamics.pos_dim
         self.node_nfs = dynamics.node_nfs
@@ -262,16 +268,19 @@ class EnSB(nn.Module):
         representations: List[Dict],
         conditions: Union[Tensor, Dict],
         ot_ode: bool = True,
-        atom_weights: Optional[Tensor] = None,
+        atom_weights_prior: Optional[Tensor] = None,
     ):
         r"""
         Computes the loss and NLL terms.
 
         Args:
-            atom_weights: (n_atoms,) per-atom weights for the target fragment.
-                If None, uniform weights (standard MSE) are used. Otherwise
-                loss is sum_i(w_i * ||pred_i - label_i||^2) / sum_i(w_i),
-                per molecule, then averaged over the batch.
+            atom_weights_prior: optional (n_target_atoms,) per-atom prior weights.
+                Produced by ``compute_weights_for_batch`` (Idea 1-A: flat, graph-
+                distance exp-decay) or ``compute_hierarchical_weights_for_batch``
+                (Idea 1-C / CD: 3-tier + bond-angle correction). Used as the KL
+                regularization target when ``dynamics.learn_importance`` is on
+                (= cb-CD). When the dynamics does not learn importance, these
+                weights are applied directly to the FM loss (cb-A / cb-C).
 
         #TODO: edge_attr not considered at all
         """
@@ -283,11 +292,10 @@ class EnSB(nn.Module):
         fragments_nodes = [repr["size"] for repr in representations]
         n_frag_switch = get_n_frag_switch(fragments_nodes)
 
-        # Graph-distance atom weights for the target fragment. If caller did
-        # not pass them, fall back to per-representation dict so data loaders
-        # that precompute weights still work.
-        if atom_weights is None:
-            atom_weights = representations[self.idx].get("atom_weights", None)
+        # Fall back to the per-representation cache if the caller did not
+        # pass the prior explicitly (keeps dataloader wiring simple).
+        if atom_weights_prior is None:
+            atom_weights_prior = representations[self.idx].get("atom_weights", None)
 
         # Normalize data, take into account volume change in x.
         representations = self.normalizer.normalize(representations)
@@ -334,7 +342,7 @@ class EnSB(nn.Module):
 
         # Neural net prediction.
         cond = conditions["condition"] if self.ts_guess else conditions
-        net_eps_xh, _ = self.dynamics(
+        net_eps_xh, _, importance_per_frag = self.dynamics(
             xh=xh_t,
             edge_index=edge_index,
             t=t,
@@ -347,28 +355,62 @@ class EnSB(nn.Module):
         pred = net_eps_xh[self.idx][:, : self.pos_dim]
         label = self.compute_label(timestep.squeeze(), x0, xt)
 
-        if atom_weights is not None:
-            # atom_weights: (n_target_atoms,) — precomputed continuous weights.
-            # sq_error summed over pos_dim per atom, then per-molecule
-            # weight-normalized mean (Idea 1-A spec):
-            #     loss_m = sum_i(w_i * ||pred_i - label_i||^2) / sum_i(w_i)
-            #     loss   = mean_m(loss_m) / pos_dim
-            # The /pos_dim keeps the scale comparable to F.mse_loss so the
-            # optimizer hyperparameters remain valid.
-            sq_error = (pred - label).pow(2).sum(dim=-1)  # (n_target_atoms,)
-            target_mask = masks[self.idx].to(sq_error.device)
-            atom_weights = atom_weights.to(sq_error.device).to(sq_error.dtype)
-            weighted_sq_error = atom_weights * sq_error
-            weighted_sum = scatter_add(weighted_sq_error, target_mask, dim=0)
+        target_mask = masks[self.idx].to(pred.device)
+        sq_error = (pred - label).pow(2).sum(dim=-1)  # (n_target_atoms,)
+        loss_kl_tensor = torch.zeros((), device=pred.device, dtype=pred.dtype)
+
+        if importance_per_frag is not None:
+            # --- Idea 1-D / CD: learned per-atom importance + KL-to-prior ---
+            raw_importance = importance_per_frag[self.idx]
+            w_min = float(self.learned_w_min)
+            learned_weights = torch.sigmoid(raw_importance) * (1.0 - w_min) + w_min
+
+            weighted_sum = scatter_add(learned_weights * sq_error, target_mask, dim=0)
+            weight_sum = scatter_add(learned_weights, target_mask, dim=0)
+            per_mol = weighted_sum / (weight_sum + 1e-8)
+            loss_fm = per_mol.mean() / self.pos_dim
+
+            if atom_weights_prior is not None:
+                prior = atom_weights_prior.to(learned_weights.device).to(learned_weights.dtype)
+                # Normalize both to per-molecule probability simplices so the
+                # KL term compares relative attention, not raw magnitude.
+                # In cb-CD the prior is hierarchical (Core/Interface/Peripheral
+                # + bond-angle); in cb-A/AB it is a flat exp-decay curve. The
+                # KL math is identical in both cases because both priors are
+                # positive (N,) vectors; only the target shape differs.
+                p_norm = scatter_add(learned_weights, target_mask, dim=0)[target_mask] + 1e-8
+                q_norm = scatter_add(prior, target_mask, dim=0)[target_mask] + 1e-8
+                p = learned_weights / p_norm
+                q = prior / q_norm
+                kl_per_atom = p * torch.log((p + 1e-8) / (q + 1e-8))
+                kl_per_mol = scatter_add(kl_per_atom, target_mask, dim=0)
+                loss_kl = kl_per_mol.mean()
+            else:
+                loss_kl = torch.zeros((), device=loss_fm.device, dtype=loss_fm.dtype)
+
+            loss = loss_fm + float(self.kl_weight) * loss_kl
+            loss_kl_tensor = loss_kl.detach()
+
+        elif atom_weights_prior is not None:
+            # --- Fixed-weight fallback (cb-A / cb-C behavior) ---
+            atom_weights = atom_weights_prior.to(sq_error.device).to(sq_error.dtype)
+            weighted_sum = scatter_add(atom_weights * sq_error, target_mask, dim=0)
             weight_sum = scatter_add(atom_weights, target_mask, dim=0)
-            per_mol_loss = weighted_sum / (weight_sum + 1e-8)
-            loss = per_mol_loss.mean() / self.pos_dim
+            per_mol = weighted_sum / (weight_sum + 1e-8)
+            loss_fm = per_mol.mean() / self.pos_dim
+            loss = loss_fm
+
         else:
-            loss = F.mse_loss(pred, label)
+            # --- Uniform-weight fallback (vanilla React-OT) ---
+            loss_fm = F.mse_loss(pred, label)
+            loss = loss_fm
+
         scaled_err = compute_scaled_err(pred, label)
 
         loss_terms = {
             "loss": loss,
+            "loss_fm": loss_fm.detach(),
+            "loss_kl": loss_kl_tensor,
             "scaled_err": scaled_err,
             "pred": pred,
             "label": label,
@@ -531,7 +573,9 @@ class EnSB(nn.Module):
             # xh_t[2][:, : self.pos_dim] = xt_p.to(xt.device)
 
             _cond = conditions["condition"] if self.ts_guess else conditions
-            net_eps_xh, _ = self.dynamics(
+            # Inference: importance logits are discarded — per the md spec,
+            # the ODE solver only consumes velocity.
+            net_eps_xh, _, _ = self.dynamics(
                 xh=xh_t,
                 edge_index=edge_index,
                 t=t,

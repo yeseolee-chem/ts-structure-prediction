@@ -110,8 +110,9 @@ class BaseDataset(Dataset):
         - ``mode="hierarchical"`` (Idea 1-C): 3-Tier (Core/Interface/Peripheral)
           with interface atoms corrected by R→P bond-angle change.
 
-        The same weight vector is replicated across all fragments because
-        R/TS/P share atom ordering.
+        In Idea 1-CD the resulting vector is used as the KL prior that the
+        importance head is regularized toward; in cb-A / cb-C it is applied
+        as a fixed FM-loss weight.
 
         Args:
             r_idx: fragment index for reactant positions.
@@ -119,7 +120,7 @@ class BaseDataset(Dataset):
             n_fragments: number of fragments to replicate weights across.
             w_min: peripheral / graph-infinity weight.
             lambda_decay: decay length in hop units.
-            mode: "flat" (Idea 1-A) or "hierarchical" (Idea 1-C).
+            mode: "flat" (Idea 1-A) or "hierarchical" (Idea 1-C / CD).
             beta_angle: Idea 1-C — interface bond-angle correction strength.
             interface_max_hop: Idea 1-C — max graph distance counted as Interface.
             normalize: Idea 1-C — per-molecule mean-normalize the weights.

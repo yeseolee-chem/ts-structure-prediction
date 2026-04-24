@@ -481,7 +481,7 @@ class ProcessedHalo8(Dataset):
         graph_weights_enabled: bool = True,
         graph_weights_w_min: float = 0.1,
         graph_weights_lambda: float = 2.0,
-        # Idea 1-C: hierarchical 3-Tier + bond-angle correction
+        # Idea 1-C / CD: hierarchical 3-Tier + bond-angle correction
         graph_weights_mode: str = "hierarchical",
         graph_weights_beta_angle: float = 1.0,
         graph_weights_interface_max_hop: int = 2,
@@ -666,8 +666,9 @@ class ProcessedHalo8(Dataset):
         ]
 
         if graph_weights_enabled and not zero_charge:
-            # Idea 1-A / 1-C: per-atom weights for FM loss. R = fragment 0,
-            # P = fragment 2, atomic numbers in charge_0.
+            # Idea 1-CD: hierarchical C-prior fed into the KL regularization
+            # target for Halo8. R = fragment 0, P = fragment 2, atomic numbers
+            # in charge_0. Set ``graph_weights_mode="flat"`` to revert to cb-A.
             self._attach_atom_weights(
                 r_idx=0, p_idx=2, n_fragments=3,
                 w_min=graph_weights_w_min,
