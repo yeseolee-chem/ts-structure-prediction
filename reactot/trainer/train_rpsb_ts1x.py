@@ -354,7 +354,7 @@ def main(argv=None):
     trainer_kwargs = dict(
         # max_epochs=1000 for mid-scale runs (DATA_LIMIT=1000, ~11h on A10).
         # Use 300 for quick iteration (DATA_LIMIT=300, ~1h) or 3000 for full-dataset.
-        max_epochs=1000,
+        max_epochs=3000,
         accelerator=accelerator,
         deterministic=False,
         devices=devices,
