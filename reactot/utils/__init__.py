@@ -16,4 +16,7 @@ from .weighting import (
     get_element_importance,
     compute_element_aware_weights,
     compute_element_weights_for_batch,
+    DEFAULT_ELEMENT_ALPHA,
+    compute_hybrid_weights,
+    compute_hybrid_weights_batch_torch,
 )

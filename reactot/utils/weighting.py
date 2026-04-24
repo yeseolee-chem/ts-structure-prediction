@@ -354,3 +354,144 @@ def compute_element_weights_for_batch(
         normalize=True, custom_alpha=custom_alpha,
     )
     return weights
+
+
+# ============================================================================
+# Idea 1-AB Hybrid: graph-distance + element-aware default weighting
+# ============================================================================
+# Baseline weighting for all subsequent experiments (1-C, 1-D compare against
+# this). Identical math to compute_element_weights_for_batch but exposes a
+# dedicated `compute_hybrid_weights` entry point with metadata return so
+# Stage 5 (Weighted RMSD) can reuse the exact same weights that trained
+# Stage 2 — pipeline consistency is the whole point of the hybrid.
+#
+# DEFAULT_ELEMENT_ALPHA mirrors ELEMENT_IMPORTANCE. It is a separate constant
+# so hybrid-specific tuning does not accidentally shift 1-B's alpha values.
+
+DEFAULT_ELEMENT_ALPHA = {
+    1:  0.5,   # H
+    6:  1.0,   # C (reference)
+    7:  1.1,   # N
+    8:  1.1,   # O
+    9:  1.2,   # F
+    16: 1.3,   # S
+    17: 1.3,   # Cl
+    35: 1.4,   # Br
+}
+
+
+def compute_hybrid_weights(
+    pos_R: np.ndarray,
+    pos_P: np.ndarray,
+    atomic_numbers: np.ndarray,
+    w_min: float = 0.1,
+    lambda_decay: float = 2.0,
+    element_alpha: Optional[dict] = None,
+    normalize: bool = True,
+    return_metadata: bool = False,
+):
+    """
+    그래프 거리 + 원소 인지형 통합 가중치.
+
+        w_i = [w_min + (1 - w_min) * exp(-d_i / λ)] * α_{Z_i}
+        정규화: w̃_i = w_i / mean(w)
+
+    Stage 2 FM loss와 Stage 5 Weighted RMSD에서 동일한 함수를 재사용한다.
+
+    Args:
+        pos_R: (N, 3) reactant positions
+        pos_P: (N, 3) product positions
+        atomic_numbers: (N,) atomic numbers
+        w_min: minimum weight for distant atoms
+        lambda_decay: exponential decay scale (hops)
+        element_alpha: custom element importance dict
+            (None → DEFAULT_ELEMENT_ALPHA)
+        normalize: per-molecule normalization (mean → 1.0)
+        return_metadata: if True, return (weights, metadata_dict)
+
+    Returns:
+        weights: (N,) normalized hybrid weights
+        metadata (optional): dict with core_atoms, graph_dist, w_distance,
+            alpha, weights_raw
+    """
+    alpha_dict = element_alpha if element_alpha is not None else DEFAULT_ELEMENT_ALPHA
+
+    core = find_reactive_core_from_positions(pos_R, pos_P, atomic_numbers)
+    adj = build_adjacency_matrix(pos_R, atomic_numbers)
+    graph_dist = graph_distances_to_core(adj, core)
+
+    w_distance = compute_continuous_weights(graph_dist, w_min, lambda_decay)
+    alpha = np.array(
+        [alpha_dict.get(int(z), 1.0) for z in atomic_numbers],
+        dtype=np.float64,
+    )
+
+    weights_raw = w_distance * alpha
+    weights = weights_raw.copy()
+    if normalize and weights.mean() > 0:
+        weights = weights / weights.mean()
+
+    if return_metadata:
+        metadata = {
+            "core_atoms": sorted(int(i) for i in core),
+            "graph_dist": graph_dist,
+            "w_distance": w_distance,
+            "alpha": alpha,
+            "weights_raw": weights_raw,
+        }
+        return weights, metadata
+    return weights
+
+
+def compute_hybrid_weights_batch_torch(
+    pos_R_batch: torch.Tensor,
+    pos_P_batch: torch.Tensor,
+    atomic_numbers_batch: torch.Tensor,
+    batch_mask: torch.Tensor,
+    w_min: float = 0.1,
+    lambda_decay: float = 2.0,
+    element_alpha: Optional[dict] = None,
+) -> torch.Tensor:
+    """
+    배치 내 모든 분자에 대해 하이브리드 가중치를 계산한다.
+
+    학습 시 dataloader에서 사전 계산하는 것이 효율적이지만,
+    on-the-fly 계산이 필요할 때 이 함수를 사용한다.
+
+    Args:
+        pos_R_batch: (total_atoms, 3)
+        pos_P_batch: (total_atoms, 3)
+        atomic_numbers_batch: (total_atoms,)
+        batch_mask: (total_atoms,) molecule index per atom
+        w_min, lambda_decay, element_alpha: forwarded to
+            compute_hybrid_weights
+
+    Returns:
+        weights: (total_atoms,) float32 tensor on the input device
+    """
+    device = pos_R_batch.device
+    n_molecules = int(batch_mask.max().item()) + 1 if batch_mask.numel() else 0
+
+    chunks = []
+    for mol_idx in range(n_molecules):
+        mask = batch_mask == mol_idx
+        pos_R = pos_R_batch[mask].detach().cpu().numpy().astype(np.float64)
+        pos_P = pos_P_batch[mask].detach().cpu().numpy().astype(np.float64)
+        z = (
+            atomic_numbers_batch[mask]
+            .detach()
+            .cpu()
+            .numpy()
+            .reshape(-1)
+            .astype(np.int64)
+        )
+        w = compute_hybrid_weights(
+            pos_R, pos_P, z,
+            w_min=w_min, lambda_decay=lambda_decay,
+            element_alpha=element_alpha, normalize=True,
+        )
+        chunks.append(torch.tensor(w, dtype=torch.float32))
+
+    if not chunks:
+        return torch.zeros(0, dtype=torch.float32, device=device)
+    return torch.cat(chunks).to(device)

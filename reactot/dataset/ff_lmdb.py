@@ -693,7 +693,7 @@ class ProcessedHalo8(Dataset):
         """
         from reactot.utils.weighting import (
             compute_weights_for_batch,
-            compute_element_weights_for_batch,
+            compute_hybrid_weights,
         )
 
         pos_R_list = self.data[f"pos_{r_idx}"]
@@ -706,10 +706,11 @@ class ProcessedHalo8(Dataset):
             pos_P = pos_P_t.detach().cpu().numpy().astype(np.float64)
             atomic_numbers = charge_t.detach().cpu().numpy().reshape(-1).astype(np.int64)
             if element_aware:
-                w = compute_element_weights_for_batch(
+                # Idea 1-AB hybrid: graph-distance × α_Z, per-molecule mean=1
+                w = compute_hybrid_weights(
                     pos_R, pos_P, atomic_numbers,
                     w_min=w_min, lambda_decay=lambda_decay,
-                    custom_alpha=alpha_dict,
+                    element_alpha=alpha_dict, normalize=True,
                 )
             else:
                 w = compute_weights_for_batch(

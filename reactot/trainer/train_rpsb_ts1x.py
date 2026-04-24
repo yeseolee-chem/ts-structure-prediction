@@ -73,12 +73,24 @@ def parse_args(argv=None):
         help="Halo8 only: dand_id prefix filter. 'Mix' accepts both Halogen "
         "and T1x. Falls back to the DATASET_PREFIX env var, then 'Halogen'.",
     )
-    # Idea 1-B: element-aware FM loss weighting.
+    # Idea 1-AB hybrid: graph-distance × α_Z is the default baseline. Use
+    # --no-element-aware-weights to fall back to pure Idea 1-A (graph-distance
+    # only). This flip is the whole point of cb-AB: hybrid is now the baseline
+    # all subsequent experiments (1-C, 1-D) compare against.
     p.add_argument(
         "--element-aware-weights",
+        dest="element_aware_weights",
         action="store_true",
-        help="Idea 1-B: multiply graph-distance weight by per-element α_Z and "
-        "normalize per-molecule. Requires graph_weights_enabled (default).",
+        default=True,
+        help="Idea 1-AB hybrid (DEFAULT): multiply graph-distance weight by "
+        "per-element α_Z and normalize per-molecule.",
+    )
+    p.add_argument(
+        "--no-element-aware-weights",
+        dest="element_aware_weights",
+        action="store_false",
+        help="Disable element-aware weighting — fall back to Idea 1-A "
+        "(graph-distance decay only).",
     )
     p.add_argument(
         "--alpha-h", type=float, default=None, help="α_Z override for H (Z=1).")

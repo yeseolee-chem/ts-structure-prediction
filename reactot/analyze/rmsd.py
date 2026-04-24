@@ -108,12 +108,26 @@ def batch_rmsd_sb(
     target_xh: Tensor,
     threshold: float = 0.5,
     same_order: bool = True,
+    atom_weights: "Tensor | None" = None,
 ) -> List[float]:
 
     rmsds = []
 
     end_ind = np.cumsum(fragments_node.long().cpu().numpy())
     start_ind = np.concatenate([np.int64(np.zeros(1)), end_ind[:-1]])
+
+    if atom_weights is not None:
+        # Idea 1-AB: Weighted RMSD path. Uses same_order pairing — the weights
+        # align to atom indices from Stage 2 training, so pymatgen reordering
+        # would break the alignment.
+        w = atom_weights.detach().cpu().numpy().astype(np.float64)
+        pred = pred_xh[:, : 3].detach().cpu().numpy().astype(np.float64)
+        tgt = target_xh[:, : 3].detach().cpu().numpy().astype(np.float64)
+        for start, end in zip(start_ind, end_ind):
+            rmsds.append(
+                float(weighted_rmsd(pred[start:end], tgt[start:end], w[start:end]))
+            )
+        return rmsds
 
     for start, end in zip(start_ind, end_ind):
         mol1 = xh2pmg(pred_xh[start : end])
@@ -127,3 +141,21 @@ def batch_rmsd_sb(
         )
         rmsds.append(min(rmsd, 1.0))
     return rmsds
+
+
+def weighted_rmsd(
+    pos_pred: np.ndarray,
+    pos_true: np.ndarray,
+    weights: np.ndarray,
+) -> float:
+    """Weighted RMSD for Stage 5 / Stage 2 consistency.
+
+        RMSD_w = sqrt( sum(w_i * ||r_pred_i - r_true_i||^2) / sum(w_i) )
+
+    Assumes pos_pred and pos_true are aligned atom-for-atom (same order).
+    """
+    pos_pred = np.asarray(pos_pred, dtype=np.float64)
+    pos_true = np.asarray(pos_true, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64).reshape(-1)
+    sq_dist = np.sum((pos_pred - pos_true) ** 2, axis=1)
+    return float(np.sqrt(np.sum(weights * sq_dist) / (np.sum(weights) + 1e-8)))
