@@ -137,6 +137,26 @@ def build_configs(args):
             "Halo8 requires --data-dir or HALO8_DATADIR to be set."
         )
 
+    # Idea 1-CD per-atom prior (fed into the KL regularization target).
+    # Env overrides let the SLURM wrappers toggle between the cb-A flat prior
+    # and the cb-CD hierarchical prior without editing code.
+    prior_scheme = os.environ.get("PRIOR_SCHEME", "C").upper()
+    if prior_scheme == "C":
+        graph_weights_mode = "hierarchical"
+    elif prior_scheme == "A":
+        graph_weights_mode = "flat"
+    else:
+        raise ValueError(
+            f"PRIOR_SCHEME must be 'A' or 'C' for cb-CD, got {prior_scheme!r}."
+        )
+    graph_weights_store_tier = (
+        os.environ.get("STORE_TIER", "1") != "0" and graph_weights_mode == "hierarchical"
+    )
+    graph_weights_beta_angle = float(os.environ.get("BETA_ANGLE", "1.0"))
+    graph_weights_interface_max_hop = int(os.environ.get("INTERFACE_MAX_HOP", "2"))
+    graph_weights_w_min = float(os.environ.get("GRAPH_W_MIN", "0.1"))
+    graph_weights_lambda = float(os.environ.get("GRAPH_LAMBDA", "2.0"))
+
     training_config = dict(
         datadir=datadir,
         remove_h=False,
@@ -161,6 +181,15 @@ def build_configs(args):
             shuffle=True,
             ddp=False,
         ),
+        # cb-CD: hierarchical C-prior + tier cache for analyze_cd_tiers.py.
+        graph_weights_enabled=True,
+        graph_weights_mode=graph_weights_mode,
+        graph_weights_w_min=graph_weights_w_min,
+        graph_weights_lambda=graph_weights_lambda,
+        graph_weights_beta_angle=graph_weights_beta_angle,
+        graph_weights_interface_max_hop=graph_weights_interface_max_hop,
+        graph_weights_normalize=True,
+        graph_weights_store_tier=graph_weights_store_tier,
     )
     if args.dataset == "Halo8":
         training_config["data_limit"] = args.data_limit

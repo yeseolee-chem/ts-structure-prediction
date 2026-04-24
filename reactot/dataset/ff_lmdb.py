@@ -486,6 +486,7 @@ class ProcessedHalo8(Dataset):
         graph_weights_beta_angle: float = 1.0,
         graph_weights_interface_max_hop: int = 2,
         graph_weights_normalize: bool = True,
+        graph_weights_store_tier: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -677,6 +678,7 @@ class ProcessedHalo8(Dataset):
                 beta_angle=graph_weights_beta_angle,
                 interface_max_hop=graph_weights_interface_max_hop,
                 normalize=graph_weights_normalize,
+                store_tier=graph_weights_store_tier,
             )
 
     def _attach_atom_weights(
@@ -690,14 +692,18 @@ class ProcessedHalo8(Dataset):
         beta_angle: float = 1.0,
         interface_max_hop: int = 2,
         normalize: bool = True,
+        store_tier: bool = False,
     ):
         """Same algorithm as BaseDataset.attach_atom_weights.
 
         Replicated here because ProcessedHalo8 does not inherit from
         BaseDataset but shares the same per-fragment data layout.
+        ``store_tier=True`` additionally caches the CD tier label under
+        ``atom_tier_{i}`` for offline analysis.
         """
         from reactot.utils.weighting import (
             compute_weights_for_batch,
+            compute_hierarchical_weights,
             compute_hierarchical_weights_for_batch,
         )
 
@@ -712,19 +718,35 @@ class ProcessedHalo8(Dataset):
             )
 
         weights_per_sample = []
+        tier_per_sample = []
+        store_tier_active = bool(store_tier) and mode == "hierarchical"
         for pos_R_t, pos_P_t, charge_t in zip(pos_R_list, pos_P_list, charge_list):
             pos_R = pos_R_t.detach().cpu().numpy().astype(np.float64)
             pos_P = pos_P_t.detach().cpu().numpy().astype(np.float64)
             atomic_numbers = charge_t.detach().cpu().numpy().reshape(-1).astype(np.int64)
             if mode == "hierarchical":
-                w = compute_hierarchical_weights_for_batch(
-                    pos_R, pos_P, atomic_numbers,
-                    w_min=w_min,
-                    lambda_decay=lambda_decay,
-                    beta_angle=beta_angle,
-                    interface_max_hop=interface_max_hop,
-                    normalize=normalize,
-                )
+                if store_tier_active:
+                    w, meta = compute_hierarchical_weights(
+                        pos_R, pos_P, atomic_numbers,
+                        w_min=w_min,
+                        lambda_decay=lambda_decay,
+                        beta_angle=beta_angle,
+                        interface_max_hop=interface_max_hop,
+                        normalize=normalize,
+                        return_metadata=True,
+                    )
+                    tier_per_sample.append(
+                        torch.tensor(meta["tier"], dtype=torch.int64, device=self.device)
+                    )
+                else:
+                    w = compute_hierarchical_weights_for_batch(
+                        pos_R, pos_P, atomic_numbers,
+                        w_min=w_min,
+                        lambda_decay=lambda_decay,
+                        beta_angle=beta_angle,
+                        interface_max_hop=interface_max_hop,
+                        normalize=normalize,
+                    )
             else:
                 w = compute_weights_for_batch(
                     pos_R, pos_P, atomic_numbers,
@@ -736,6 +758,8 @@ class ProcessedHalo8(Dataset):
 
         for idx in range(n_fragments):
             self.data[f"atom_weights_{idx}"] = weights_per_sample
+            if store_tier_active:
+                self.data[f"atom_tier_{idx}"] = tier_per_sample
 
     def __len__(self):
         return self.n_samples

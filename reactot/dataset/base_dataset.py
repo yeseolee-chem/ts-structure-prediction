@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from reactot.dataset.datasets_config import ATOM_MAPPING, SAM_CHARGED_ATOM_MAPPING
 from reactot.utils.weighting import (
     compute_weights_for_batch,
+    compute_hierarchical_weights,
     compute_hierarchical_weights_for_batch,
 )
 
@@ -101,6 +102,7 @@ class BaseDataset(Dataset):
         beta_angle: float = 1.0,
         interface_max_hop: int = 2,
         normalize: bool = True,
+        store_tier: bool = False,
     ):
         """Precompute per-sample atom weights.
 
@@ -124,6 +126,10 @@ class BaseDataset(Dataset):
             beta_angle: Idea 1-C — interface bond-angle correction strength.
             interface_max_hop: Idea 1-C — max graph distance counted as Interface.
             normalize: Idea 1-C — per-molecule mean-normalize the weights.
+            store_tier: Idea 1-CD analysis — also cache the per-atom tier label
+                (1=Core, 2=Interface, 3=Peripheral) under ``atom_tier_{i}``.
+                Only makes sense with ``mode="hierarchical"``; ignored otherwise.
+                Slight memory cost; leave off for production training.
         """
         pos_R_list = self.data[f"pos_{r_idx}"]
         pos_P_list = self.data[f"pos_{p_idx}"]
@@ -141,19 +147,35 @@ class BaseDataset(Dataset):
             )
 
         weights_per_sample = []
+        tier_per_sample = []
+        store_tier_active = bool(store_tier) and mode == "hierarchical"
         for pos_R_t, pos_P_t, charge_t in zip(pos_R_list, pos_P_list, charge_list):
             pos_R = pos_R_t.detach().cpu().numpy().astype(np.float64)
             pos_P = pos_P_t.detach().cpu().numpy().astype(np.float64)
             atomic_numbers = charge_t.detach().cpu().numpy().reshape(-1).astype(np.int64)
             if mode == "hierarchical":
-                w = compute_hierarchical_weights_for_batch(
-                    pos_R, pos_P, atomic_numbers,
-                    w_min=w_min,
-                    lambda_decay=lambda_decay,
-                    beta_angle=beta_angle,
-                    interface_max_hop=interface_max_hop,
-                    normalize=normalize,
-                )
+                if store_tier_active:
+                    w, meta = compute_hierarchical_weights(
+                        pos_R, pos_P, atomic_numbers,
+                        w_min=w_min,
+                        lambda_decay=lambda_decay,
+                        beta_angle=beta_angle,
+                        interface_max_hop=interface_max_hop,
+                        normalize=normalize,
+                        return_metadata=True,
+                    )
+                    tier_per_sample.append(
+                        torch.tensor(meta["tier"], dtype=torch.int64, device=self.device)
+                    )
+                else:
+                    w = compute_hierarchical_weights_for_batch(
+                        pos_R, pos_P, atomic_numbers,
+                        w_min=w_min,
+                        lambda_decay=lambda_decay,
+                        beta_angle=beta_angle,
+                        interface_max_hop=interface_max_hop,
+                        normalize=normalize,
+                    )
             else:
                 w = compute_weights_for_batch(
                     pos_R, pos_P, atomic_numbers,
@@ -165,6 +187,8 @@ class BaseDataset(Dataset):
 
         for idx in range(n_fragments):
             self.data[f"atom_weights_{idx}"] = weights_per_sample
+            if store_tier_active:
+                self.data[f"atom_tier_{idx}"] = tier_per_sample
 
     def patch_dummy_molecules(self, idx):
         self.data[f"size_{idx}"] = torch.ones_like(

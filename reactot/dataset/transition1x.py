@@ -49,6 +49,7 @@ class ProcessedTS1x(BaseDataset):
         graph_weights_beta_angle: float = 1.0,
         graph_weights_interface_max_hop: int = 2,
         graph_weights_normalize: bool = True,
+        graph_weights_store_tier: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -177,4 +178,5 @@ class ProcessedTS1x(BaseDataset):
                 beta_angle=graph_weights_beta_angle,
                 interface_max_hop=graph_weights_interface_max_hop,
                 normalize=graph_weights_normalize,
+                store_tier=graph_weights_store_tier,
             )

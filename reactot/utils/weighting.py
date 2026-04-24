@@ -328,7 +328,8 @@ def compute_hierarchical_weights(
     beta_angle: float = 1.0,
     interface_max_hop: int = 2,
     normalize: bool = True,
-) -> np.ndarray:
+    return_metadata: bool = False,
+):
     """
     3-Tier 계층적 가중치 + Interface 결합각 보정.
 
@@ -344,9 +345,12 @@ def compute_hierarchical_weights(
         beta_angle: 결합각 보정 계수 (0이면 보정 없음)
         interface_max_hop: interface의 최대 hop 수
         normalize: per-molecule 정규화
+        return_metadata: True면 (weights, metadata) 튜플 반환.
+            metadata = {"tier": (N,) int, "graph_dist": (N,) int,
+                        "angle_changes": (N,) float}
 
     Returns:
-        weights: (N,) hierarchical weights
+        weights, 또는 (weights, metadata) if return_metadata=True.
     """
     # 1. Core 식별
     core = find_reactive_core_from_positions(pos_R, pos_P, atomic_numbers)
@@ -384,7 +388,81 @@ def compute_hierarchical_weights(
     if normalize:
         weights = weights / (weights.mean() + 1e-8)
 
+    if return_metadata:
+        metadata = {
+            "tier": tier.astype(np.int64),
+            "graph_dist": graph_dist.astype(np.int64),
+            "angle_changes": angle_changes.astype(np.float64),
+        }
+        return weights, metadata
     return weights
+
+
+def compute_C_prior_with_tier(
+    pos_R: np.ndarray,
+    pos_P: np.ndarray,
+    atomic_numbers: np.ndarray,
+    **kwargs,
+):
+    """
+    Idea 1-CD: C prior + tier label을 함께 반환.
+
+    CD 분석에서 D가 학습한 가중치를 tier별로 평균 내어
+    'D가 prior의 계층 구조를 따르는가?'를 검증할 때 사용.
+
+    Returns:
+        (weights, tier): weights (N,), tier (N,) int array in {1,2,3}.
+    """
+    weights, metadata = compute_hierarchical_weights(
+        pos_R, pos_P, atomic_numbers, return_metadata=True, **kwargs
+    )
+    return weights, metadata["tier"]
+
+
+def get_prior_weights(
+    pos_R: np.ndarray,
+    pos_P: np.ndarray,
+    atomic_numbers: np.ndarray,
+    prior_scheme: str = "AB",
+    **kwargs,
+):
+    """Dispatcher for per-atom prior schemes used by Idea 1-D / CD / ABD.
+
+    Args:
+        prior_scheme: one of
+            - "A"  : Idea 1-A   — graph-distance exp-decay (flat).
+            - "AB" : Idea 1-AB  — A times per-element alpha_Z (not present
+                     in cb-CD unless the AB weights module is also merged).
+            - "BC" : Idea 1-BC  — tier × element (same caveat as AB).
+            - "C"  : Idea 1-C / CD — 3-Tier hierarchical + bond-angle.
+
+    Returns:
+        weights: (N,) array, per-molecule mean-normalized when normalize=True.
+    """
+    if prior_scheme == "A":
+        return compute_weights_for_batch(pos_R, pos_P, atomic_numbers, **kwargs)
+    if prior_scheme in ("AB", "A+B"):
+        try:
+            from reactot.utils.weighting import compute_hybrid_weights  # type: ignore
+        except ImportError as exc:
+            raise ValueError(
+                "prior_scheme='AB' requires compute_hybrid_weights, which is "
+                "only present when the cb-AB branch is merged in."
+            ) from exc
+        return compute_hybrid_weights(pos_R, pos_P, atomic_numbers, **kwargs)
+    if prior_scheme in ("BC", "B+C"):
+        try:
+            from reactot.utils.weighting import compute_bc_weights  # type: ignore
+        except ImportError as exc:
+            raise ValueError(
+                "prior_scheme='BC' requires compute_bc_weights (cb-BC branch)."
+            ) from exc
+        return compute_bc_weights(pos_R, pos_P, atomic_numbers, **kwargs)
+    if prior_scheme == "C":
+        return compute_hierarchical_weights(
+            pos_R, pos_P, atomic_numbers, **kwargs
+        )
+    raise ValueError(f"Unknown prior_scheme: {prior_scheme!r}")
 
 
 def compute_hierarchical_weights_for_batch(

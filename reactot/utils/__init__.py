@@ -18,4 +18,7 @@ from .weighting import (
     compute_hierarchical_weights,
     compute_hierarchical_weights_for_batch,
     weighted_rmsd,
+    # Idea 1-CD: dispatcher + tier-aware C-prior wrapper
+    get_prior_weights,
+    compute_C_prior_with_tier,
 )
