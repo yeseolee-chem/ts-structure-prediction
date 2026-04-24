@@ -6,7 +6,7 @@ from torch.utils.data import Dataset
 import torch.nn.functional as F
 
 from reactot.dataset.datasets_config import ATOM_MAPPING, SAM_CHARGED_ATOM_MAPPING
-from reactot.utils.weighting import compute_weights_for_batch
+from reactot.utils.weighting import get_prior_weights
 
 
 class BaseDataset(Dataset):
@@ -94,11 +94,17 @@ class BaseDataset(Dataset):
         n_fragments: int = 3,
         w_min: float = 0.1,
         lambda_decay: float = 2.0,
+        prior_scheme: str = "AB",
+        element_alpha: dict = None,
     ):
-        """Precompute graph-distance-based continuous atom weights per sample.
+        """Precompute per-sample atom weights used as Idea 1-D KL prior.
 
-        Used as the Idea 1-D *prior* — the importance head learns weights
-        that get KL-regularized toward these fixed per-atom priors.
+        ABD upgrade: ``prior_scheme`` picks the prior formula.
+            'A'  → graph-distance decay only (cb-D original).
+            'AB' → graph-distance × α_Z hybrid (this branch's default).
+
+        The importance head (Idea 1-D) learns per-atom weights that are
+        KL-regularized toward these fixed priors.
         """
         pos_R_list = self.data[f"pos_{r_idx}"]
         pos_P_list = self.data[f"pos_{p_idx}"]
@@ -109,14 +115,19 @@ class BaseDataset(Dataset):
             )
         charge_list = self.data[f"charge_{r_idx}"]
 
+        prior_kwargs = {"w_min": w_min, "lambda_decay": lambda_decay}
+        if prior_scheme == "AB" and element_alpha is not None:
+            prior_kwargs["element_alpha"] = element_alpha
+
         weights_per_sample = []
         for pos_R_t, pos_P_t, charge_t in zip(pos_R_list, pos_P_list, charge_list):
             pos_R = pos_R_t.detach().cpu().numpy().astype(np.float64)
             pos_P = pos_P_t.detach().cpu().numpy().astype(np.float64)
             atomic_numbers = charge_t.detach().cpu().numpy().reshape(-1).astype(np.int64)
-            w = compute_weights_for_batch(
+            w = get_prior_weights(
                 pos_R, pos_P, atomic_numbers,
-                w_min=w_min, lambda_decay=lambda_decay,
+                prior_scheme=prior_scheme,
+                **prior_kwargs,
             )
             weights_per_sample.append(
                 torch.tensor(w, dtype=torch.float32, device=self.device)

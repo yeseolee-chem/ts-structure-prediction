@@ -72,6 +72,14 @@ def parse_args(argv=None):
         help="Halo8 only: dand_id prefix filter. 'Mix' accepts both Halogen "
         "and T1x. Falls back to the DATASET_PREFIX env var, then 'Halogen'.",
     )
+    p.add_argument(
+        "--prior-scheme",
+        choices=["A", "AB", "B"],
+        default=os.environ.get("PRIOR_SCHEME", "AB"),
+        help="Idea 1-ABD: KL prior scheme. 'A' = graph-distance only "
+        "(cb-D original). 'AB' = graph-distance × α_Z hybrid (cb-ABD default). "
+        "'B' = element-aware only.",
+    )
     args = p.parse_args(argv)
 
     if args.data_dir is None:
@@ -161,6 +169,9 @@ def build_configs(args):
             shuffle=True,
             ddp=False,
         ),
+        # Idea 1-ABD: KL prior formula for the learned importance head.
+        # Forwarded into the dataset __init__ via **training_config.
+        prior_scheme=args.prior_scheme,
     )
     if args.dataset == "Halo8":
         training_config["data_limit"] = args.data_limit

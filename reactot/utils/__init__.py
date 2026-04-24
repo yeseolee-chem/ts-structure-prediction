@@ -12,4 +12,12 @@ from .weighting import (
     graph_distances_to_core,
     build_adjacency_matrix,
     compute_continuous_weights,
+    ELEMENT_IMPORTANCE,
+    get_element_importance,
+    compute_element_aware_weights,
+    compute_element_weights_for_batch,
+    DEFAULT_ELEMENT_ALPHA,
+    compute_hybrid_weights,
+    compute_hybrid_weights_batch_torch,
+    get_prior_weights,
 )

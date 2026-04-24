@@ -481,6 +481,8 @@ class ProcessedHalo8(Dataset):
         graph_weights_enabled: bool = True,
         graph_weights_w_min: float = 0.1,
         graph_weights_lambda: float = 2.0,
+        prior_scheme: str = "AB",
+        element_alpha: dict = None,
         **kwargs,
     ):
         super().__init__()
@@ -661,12 +663,15 @@ class ProcessedHalo8(Dataset):
         ]
 
         if graph_weights_enabled and not zero_charge:
-            # Idea 1-D prior: graph-distance exponential-decay atom weights.
-            # R = fragment 0, P = fragment 2, atomic numbers in charge_0.
+            # Idea 1-ABD prior: ``prior_scheme`` picks the KL prior formula.
+            # 'A'  → graph-distance decay only (cb-D original)
+            # 'AB' → graph-distance × α_Z hybrid (ABD default)
             self._attach_atom_weights(
                 r_idx=0, p_idx=2, n_fragments=3,
                 w_min=graph_weights_w_min,
                 lambda_decay=graph_weights_lambda,
+                prior_scheme=prior_scheme,
+                element_alpha=element_alpha,
             )
 
     def _attach_atom_weights(
@@ -676,26 +681,33 @@ class ProcessedHalo8(Dataset):
         n_fragments: int = 3,
         w_min: float = 0.1,
         lambda_decay: float = 2.0,
+        prior_scheme: str = "AB",
+        element_alpha: dict = None,
     ):
         """Same algorithm as BaseDataset.attach_atom_weights.
 
         Replicated here because ProcessedHalo8 does not inherit from
         BaseDataset but shares the same per-fragment data layout.
         """
-        from reactot.utils.weighting import compute_weights_for_batch
+        from reactot.utils.weighting import get_prior_weights
 
         pos_R_list = self.data[f"pos_{r_idx}"]
         pos_P_list = self.data[f"pos_{p_idx}"]
         charge_list = self.data[f"charge_{r_idx}"]
+
+        prior_kwargs = {"w_min": w_min, "lambda_decay": lambda_decay}
+        if prior_scheme == "AB" and element_alpha is not None:
+            prior_kwargs["element_alpha"] = element_alpha
 
         weights_per_sample = []
         for pos_R_t, pos_P_t, charge_t in zip(pos_R_list, pos_P_list, charge_list):
             pos_R = pos_R_t.detach().cpu().numpy().astype(np.float64)
             pos_P = pos_P_t.detach().cpu().numpy().astype(np.float64)
             atomic_numbers = charge_t.detach().cpu().numpy().reshape(-1).astype(np.int64)
-            w = compute_weights_for_batch(
+            w = get_prior_weights(
                 pos_R, pos_P, atomic_numbers,
-                w_min=w_min, lambda_decay=lambda_decay,
+                prior_scheme=prior_scheme,
+                **prior_kwargs,
             )
             weights_per_sample.append(
                 torch.tensor(w, dtype=torch.float32, device=self.device)

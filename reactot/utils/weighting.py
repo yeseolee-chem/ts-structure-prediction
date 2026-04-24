@@ -239,3 +239,226 @@ def compute_weights_torch(graph_dist_tensor: torch.Tensor,
         weights: same shape as input
     """
     return w_min + (1.0 - w_min) * torch.exp(-graph_dist_tensor / lambda_decay)
+
+
+# ============================================================================
+# Idea 1-B: Element-Aware Weighting
+# ============================================================================
+# Extends Idea 1-A by multiplying the graph-distance weight with a
+# per-element coefficient α_Z, reflecting that atoms of different elements
+# have different steric/electronic impact on TS geometry even at the same
+# graph distance.
+#
+# References:
+#   - Bondi, J. Phys. Chem. 1964, DOI: 10.1021/j100785a001 (vdW radii)
+#   - Pearson, Inorg. Chem. 1988, DOI: 10.1021/ic00281a023 (HSAB / polarizability)
+
+ELEMENT_IMPORTANCE = {
+    1:  0.5,   # H  — 회전 자유도 높고 TS 기여 낮음
+    6:  1.0,   # C  — 기준 원소
+    7:  1.1,   # N  — lone pair, 전기음성도
+    8:  1.1,   # O  — lone pair, 전기음성도
+    9:  1.2,   # F  — 높은 전기음성도, 작은 크기
+    16: 1.3,   # S  — 큰 원자, d-orbital 참여
+    17: 1.3,   # Cl — 중간 분극율 (Halo8에서 Cl은 Z=17)
+    35: 1.4,   # Br — 가장 큰 분극율, steric effect
+}
+
+
+def get_element_importance(atomic_number: int) -> float:
+    """원자번호로부터 중요도 계수를 반환한다."""
+    return ELEMENT_IMPORTANCE.get(int(atomic_number), 1.0)
+
+
+def compute_element_aware_weights(
+    graph_dist: np.ndarray,
+    atomic_numbers: np.ndarray,
+    w_min: float = 0.1,
+    lambda_decay: float = 2.0,
+    normalize: bool = True,
+    custom_alpha: Optional[dict] = None,
+) -> np.ndarray:
+    """
+    그래프 거리 + 원소별 계수를 결합한 가중치.
+
+        w_i = [w_min + (1 - w_min) * exp(-d_i / λ)] * α_{Z_i}
+    """
+    distance_weights = compute_continuous_weights(graph_dist, w_min, lambda_decay)
+
+    alpha_dict = custom_alpha if custom_alpha is not None else ELEMENT_IMPORTANCE
+    alpha = np.array(
+        [alpha_dict.get(int(z), 1.0) for z in atomic_numbers],
+        dtype=np.float64,
+    )
+    weights = distance_weights * alpha
+
+    if normalize:
+        weights = weights / (weights.mean() + 1e-8)
+
+    return weights
+
+
+def compute_element_weights_for_batch(
+    pos_R: np.ndarray,
+    pos_P: np.ndarray,
+    atomic_numbers: np.ndarray,
+    w_min: float = 0.1,
+    lambda_decay: float = 2.0,
+    custom_alpha: Optional[dict] = None,
+) -> np.ndarray:
+    """전체 파이프라인: 좌표 → core → 거리 → 원소 가중치 (1-B)."""
+    core = find_reactive_core_from_positions(pos_R, pos_P, atomic_numbers)
+    adj = build_adjacency_matrix(pos_R, atomic_numbers)
+    graph_dist = graph_distances_to_core(adj, core)
+    weights = compute_element_aware_weights(
+        graph_dist, atomic_numbers,
+        w_min=w_min, lambda_decay=lambda_decay,
+        normalize=True, custom_alpha=custom_alpha,
+    )
+    return weights
+
+
+# ============================================================================
+# Idea 1-AB Hybrid: graph-distance + element-aware default weighting
+# ============================================================================
+# DEFAULT_ELEMENT_ALPHA mirrors ELEMENT_IMPORTANCE so hybrid-specific tuning
+# does not accidentally shift 1-B's alpha values.
+
+DEFAULT_ELEMENT_ALPHA = {
+    1:  0.5,   # H
+    6:  1.0,   # C (reference)
+    7:  1.1,   # N
+    8:  1.1,   # O
+    9:  1.2,   # F
+    16: 1.3,   # S
+    17: 1.3,   # Cl
+    35: 1.4,   # Br
+}
+
+
+def compute_hybrid_weights(
+    pos_R: np.ndarray,
+    pos_P: np.ndarray,
+    atomic_numbers: np.ndarray,
+    w_min: float = 0.1,
+    lambda_decay: float = 2.0,
+    element_alpha: Optional[dict] = None,
+    normalize: bool = True,
+    return_metadata: bool = False,
+):
+    """
+    그래프 거리 + 원소 인지형 통합 가중치 (1-AB).
+
+        w_i = [w_min + (1 - w_min) * exp(-d_i / λ)] * α_{Z_i}
+        정규화: w̃_i = w_i / mean(w)
+
+    ABD(이 branch)에서는 D의 학습 가능 가중치에 대한 KL prior로 사용된다.
+    """
+    alpha_dict = element_alpha if element_alpha is not None else DEFAULT_ELEMENT_ALPHA
+
+    core = find_reactive_core_from_positions(pos_R, pos_P, atomic_numbers)
+    adj = build_adjacency_matrix(pos_R, atomic_numbers)
+    graph_dist = graph_distances_to_core(adj, core)
+
+    w_distance = compute_continuous_weights(graph_dist, w_min, lambda_decay)
+    alpha = np.array(
+        [alpha_dict.get(int(z), 1.0) for z in atomic_numbers],
+        dtype=np.float64,
+    )
+
+    weights_raw = w_distance * alpha
+    weights = weights_raw.copy()
+    if normalize and weights.mean() > 0:
+        weights = weights / weights.mean()
+
+    if return_metadata:
+        metadata = {
+            "core_atoms": sorted(int(i) for i in core),
+            "graph_dist": graph_dist,
+            "w_distance": w_distance,
+            "alpha": alpha,
+            "weights_raw": weights_raw,
+        }
+        return weights, metadata
+    return weights
+
+
+def compute_hybrid_weights_batch_torch(
+    pos_R_batch: torch.Tensor,
+    pos_P_batch: torch.Tensor,
+    atomic_numbers_batch: torch.Tensor,
+    batch_mask: torch.Tensor,
+    w_min: float = 0.1,
+    lambda_decay: float = 2.0,
+    element_alpha: Optional[dict] = None,
+) -> torch.Tensor:
+    """배치 버전 hybrid 가중치 — on-the-fly 계산용."""
+    device = pos_R_batch.device
+    n_molecules = int(batch_mask.max().item()) + 1 if batch_mask.numel() else 0
+
+    chunks = []
+    for mol_idx in range(n_molecules):
+        mask = batch_mask == mol_idx
+        pos_R = pos_R_batch[mask].detach().cpu().numpy().astype(np.float64)
+        pos_P = pos_P_batch[mask].detach().cpu().numpy().astype(np.float64)
+        z = (
+            atomic_numbers_batch[mask]
+            .detach()
+            .cpu()
+            .numpy()
+            .reshape(-1)
+            .astype(np.int64)
+        )
+        w = compute_hybrid_weights(
+            pos_R, pos_P, z,
+            w_min=w_min, lambda_decay=lambda_decay,
+            element_alpha=element_alpha, normalize=True,
+        )
+        chunks.append(torch.tensor(w, dtype=torch.float32))
+
+    if not chunks:
+        return torch.zeros(0, dtype=torch.float32, device=device)
+    return torch.cat(chunks).to(device)
+
+
+# ============================================================================
+# Idea 1-ABD Prior Dispatcher
+# ============================================================================
+# 학습 가능 가중치(D)의 KL prior 계산을 하나의 엔트리포인트로 통합한다.
+# D 코드는 바꾸지 않고 prior 계산만 교체하는 ABD의 핵심.
+
+def get_prior_weights(
+    pos_R: np.ndarray,
+    pos_P: np.ndarray,
+    atomic_numbers: np.ndarray,
+    prior_scheme: str = "AB",
+    **kwargs,
+) -> np.ndarray:
+    """
+    학습 가능 가중치(D)의 KL prior를 계산하는 dispatcher.
+
+    prior_scheme:
+        'A'  : Idea 1-A 거리 기반만 (D 원본)
+        'AB' : Idea 1-AB hybrid (거리 × 원소) — ABD 기본값
+        'B'  : Idea 1-B 원소 단독 (거리 decay 없음 ≈ λ→∞ 또는 w_min=1)
+        'C'  : 계층적 (미구현 — 추후 확장)
+
+    모든 scheme은 동일한 (N,) 정규화된 가중치 array를 반환한다.
+    """
+    if prior_scheme == "A":
+        return compute_weights_for_batch(
+            pos_R, pos_P, atomic_numbers, **kwargs,
+        )
+    elif prior_scheme == "AB":
+        return compute_hybrid_weights(
+            pos_R, pos_P, atomic_numbers, **kwargs,
+        )
+    elif prior_scheme == "B":
+        return compute_element_weights_for_batch(
+            pos_R, pos_P, atomic_numbers, **kwargs,
+        )
+    else:
+        raise ValueError(
+            f"Unknown prior_scheme: {prior_scheme!r}. "
+            "Expected one of {'A', 'AB', 'B'}."
+        )
