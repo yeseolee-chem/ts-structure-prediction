@@ -17,6 +17,35 @@ except ImportError:
     _RDKIT_AVAILABLE = False
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Covalent radii in Angstroms.
+#
+# Source: Cordero, B. et al. "Covalent radii revisited."
+# Dalton Trans., 2008, 2832-2838. DOI: 10.1039/b801115j
+#
+# Used to detect bonds via the threshold (r_i + r_j) * 1.3, which is the
+# standard practice for empirical bond perception (RDKit also uses ~1.3×
+# sum of covalent radii). The 1.3 multiplier accommodates lengthened bonds
+# in transition states.
+#
+# Halo8 dataset (Lee et al., Sci. Data, 2025; DOI: 10.1038/s41597-025-05944-3)
+# atomic species included: H, C, N, O, F, S, Br. Cl is included here for
+# defensive future-proofing even though Halo8 currently has no Cl reactions.
+# ─────────────────────────────────────────────────────────────────────────
+COVALENT_RADII_ANGSTROM = {
+    1:  0.31,  # H
+    6:  0.76,  # C
+    7:  0.71,  # N
+    8:  0.66,  # O
+    9:  0.57,  # F
+    16: 1.05,  # S
+    17: 1.02,  # Cl  (defensive; not in current Halo8)
+    35: 1.20,  # Br
+}
+# Default for unknown elements: midpoint of typical organic-element range.
+_COVALENT_RADIUS_FALLBACK = 0.77
+
+
 def find_reactive_core_from_smiles(smiles_R: str, smiles_P: str) -> Set[int]:
     """
     R과 P의 SMILES에서 결합 변화(symmetric difference)를 탐지하여
@@ -80,14 +109,14 @@ def find_reactive_core_from_positions(pos_R: np.ndarray, pos_P: np.ndarray,
     dist_P = cdist(pos_P, pos_P)
 
     # 공유결합 반지름 기반 결합 판정 (1.3배 이내)
-    covalent_radii = {1: 0.31, 6: 0.76, 7: 0.71, 8: 0.66,
-                      9: 0.57, 16: 1.05, 17: 1.02, 35: 1.20}
+    # Use the module-level table (with Cordero 2008 citation, DOI: 10.1039/b801115j).
+    covalent_radii = COVALENT_RADII_ANGSTROM
 
     core = set()
     for i in range(N):
         for j in range(i + 1, N):
-            r_cov = covalent_radii.get(int(atomic_numbers[i]), 0.77) + \
-                    covalent_radii.get(int(atomic_numbers[j]), 0.77)
+            r_cov = covalent_radii.get(int(atomic_numbers[i]), _COVALENT_RADIUS_FALLBACK) + \
+                    covalent_radii.get(int(atomic_numbers[j]), _COVALENT_RADIUS_FALLBACK)
 
             bonded_R = dist_R[i, j] < r_cov * 1.3
             bonded_P = dist_P[i, j] < r_cov * 1.3
@@ -157,8 +186,8 @@ def build_adjacency_matrix(positions: np.ndarray, atomic_numbers: np.ndarray) ->
     """
     from scipy.spatial.distance import cdist
 
-    covalent_radii = {1: 0.31, 6: 0.76, 7: 0.71, 8: 0.66,
-                      9: 0.57, 16: 1.05, 17: 1.02, 35: 1.20}
+    # Use the module-level table (with Cordero 2008 citation, DOI: 10.1039/b801115j).
+    covalent_radii = COVALENT_RADII_ANGSTROM
 
     N = positions.shape[0]
     dist = cdist(positions, positions)
@@ -166,8 +195,8 @@ def build_adjacency_matrix(positions: np.ndarray, atomic_numbers: np.ndarray) ->
 
     for i in range(N):
         for j in range(i + 1, N):
-            r_cov = covalent_radii.get(int(atomic_numbers[i]), 0.77) + \
-                    covalent_radii.get(int(atomic_numbers[j]), 0.77)
+            r_cov = covalent_radii.get(int(atomic_numbers[i]), _COVALENT_RADIUS_FALLBACK) + \
+                    covalent_radii.get(int(atomic_numbers[j]), _COVALENT_RADIUS_FALLBACK)
             if dist[i, j] < r_cov * 1.3:
                 adj[i, j] = 1
                 adj[j, i] = 1
