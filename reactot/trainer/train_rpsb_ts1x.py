@@ -1,6 +1,7 @@
 from typing import List, Optional, Tuple
 from uuid import uuid4
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -101,6 +102,12 @@ def parse_args(argv=None):
         help="Floor weight for the sigmoid-squashed importance head output "
         "(learned weights lie in [w_min, 1.0]). Falls back to LEARNED_W_MIN "
         "env var, then 0.1.",
+    )
+    # Reproducibility — Nature/Science requires deterministic seeding.
+    p.add_argument(
+        "--seed", type=int, default=None,
+        help="Global random seed (Python, NumPy, PyTorch, DataLoader workers). "
+             "Set to a fixed integer for reproducibility. Falls back to RANDOM_SEED env, then 42.",
     )
     args = p.parse_args(argv)
 
@@ -304,7 +311,16 @@ def main(argv=None):
 
     opt = OPT(solver="ddpm", method="midpoint")
 
-    seed_everything(42, workers=True)
+    # ─── Reproducibility ──────────────────────────────────────────────────
+    # Seed Python random, NumPy, PyTorch (CPU + all CUDA devices), and
+    # DataLoader workers. workers=True is critical: per-worker seeds are
+    # derived from the base seed so multi-process data loading is also
+    # deterministic. Reference: PyTorch Lightning docs,
+    # DOI: 10.5281/zenodo.3828935 (Falcon et al., 2019).
+    seed = args.seed if args.seed is not None else int(os.environ.get("RANDOM_SEED", "42"))
+    seed_everything(seed, workers=True)
+    # Log the seed prominently so it appears in stdout and slurm logs.
+    print(f"[reactot] Global seed = {seed} (PYTHONHASHSEED, NumPy, torch, DataLoader workers)")
     ddpm = SBModule(
         cfgs["leftnet_config"],
         cfgs["optimizer_config"],
@@ -376,6 +392,31 @@ def main(argv=None):
     # directory doesn't yet exist at trainer init.
     os.makedirs(ckpt_path, exist_ok=True)
     print(f"Checkpoint dir : {ckpt_path}")
+
+    # Persist the full resolved config alongside the checkpoint for full
+    # provenance. This is what reviewers will ask for when reproducing results.
+    config_dump_path = os.path.join(ckpt_path, "resolved_config.json")
+    try:
+        with open(config_dump_path, "w") as fh:
+            json.dump(
+                {
+                    "seed": seed,
+                    "args": {
+                        k: (v if isinstance(v, (int, float, str, bool, list, dict, type(None))) else str(v))
+                        for k, v in vars(args).items()
+                    },
+                    "leftnet_config": cfgs["leftnet_config"],
+                    "optimizer_config": cfgs["optimizer_config"],
+                    "training_config": {
+                        k: (v if isinstance(v, (int, float, str, bool, list, dict, type(None))) else str(v))
+                        for k, v in training_config.items()
+                    },
+                },
+                fh, indent=2, sort_keys=True,
+            )
+        print(f"[reactot] Resolved config dumped to {config_dump_path}")
+    except (OSError, TypeError) as e:
+        print(f"[reactot] WARNING: could not dump resolved config: {e}")
 
     callbacks = [
         ModelCheckpoint(

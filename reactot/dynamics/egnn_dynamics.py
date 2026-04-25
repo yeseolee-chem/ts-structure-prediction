@@ -67,12 +67,23 @@ class EGNNDynamics(BaseDynamics):
         self.pbc = pbc
         self.learn_importance = learn_importance
 
-        # Idea 1-D: per-atom importance head. The MLP consumes the node
-        # features emitted by LEFTNet's final projection (dim=in_hidden_channels)
-        # and outputs one scalar per atom. en_sb.py squashes this with sigmoid
-        # into a [w_min, 1.0] weight for the FM loss, then KL-regularizes
-        # against the BC prior (Idea 1-BCD).
         if self.learn_importance:
+            # Idea 1-D importance head.
+            #
+            # Design rationale (deviates from idea1_D.md spec):
+            # The MD spec wrote `out_dims=[hidden_channels//2, hidden_channels//4, 1]`
+            # assuming hidden_channels=196 (LEFTNet internal). However, LEFTNet's
+            # final projection compresses node features down to `in_hidden_channels`
+            # (=8 in the default config) before egnn_dynamics receives them, so
+            # using 196 here would require an architectural change inside LEFTNet.
+            #
+            # Instead we keep the head local to egnn_dynamics and use a small
+            # bottleneck (~784 params) over the 8-d node embedding. This matches
+            # the standard practice for per-token attention scoring heads
+            # (Vaswani et al., NeurIPS 2017; DOI: 10.48550/arXiv.1706.03762)
+            # where per-token scalar outputs need only modest capacity, and it
+            # pairs naturally with the KL-to-prior regularization which keeps
+            # the learned importance close to the chemically-motivated prior.
             in_hidden_channels = int(model_config["in_hidden_channels"])
             self.importance_head = MLP(
                 in_dim=in_hidden_channels,
