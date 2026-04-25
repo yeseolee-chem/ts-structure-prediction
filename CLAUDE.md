@@ -230,6 +230,80 @@ ts-structure-prediction/
         └── xyz2mol.py
 ```
 
+## Idea-1 Branches: Reactive-Core-Aware Atom Weighting (cb-* Matrix)
+
+This repository hosts a 9-branch ablation matrix for **Idea 1**: assigning
+non-uniform atom weights in the FM loss based on proximity to the reactive
+core. Each branch is independently runnable from `reactot-halo8` base and
+shares a common dataloader / `pl_trainer` wiring through the `atom_weights`
+channel.
+
+### Single-component branches (4)
+
+| Branch | Idea | Core function | Spec MD |
+|--------|------|---------------|---------|
+| `cb-A` | Graph-distance exp-decay | `compute_weights_for_batch` | `idea1_A_graph_distance_weighting.md` |
+| `cb-B` | Per-element α_Z (polarizability prior) | `compute_element_weights_for_batch` | `idea1_B_element_aware_weighting.md` |
+| `cb-C` | 3-tier hierarchical + bond-angle | `compute_hierarchical_weights` | `idea1_C_hierarchical_weighting.md` |
+| `cb-D` | Learnable importance head + KL | `EGNNDynamics.importance_head` | `idea1_D_learnable_attention_weights.md` |
+
+### Hybrid (fixed-weight) branches (2)
+
+| Branch | Combines | Core function |
+|--------|----------|---------------|
+| `cb-AB` | A × B (distance × element) | `compute_hybrid_weights` |
+| `cb-BC` | B × C (element × tier) | `compute_bc_weights` |
+
+### Learnable+prior branches (3)
+
+D-infrastructure is shared; the difference is which prior the KL term
+regularizes against (selectable via `--prior-scheme` / `PRIOR_SCHEME` env).
+
+| Branch | Default prior | Dispatcher |
+|--------|---------------|------------|
+| `cb-CD` | `C` (3-tier) | `get_prior_weights(scheme='C')` |
+| `cb-ABD` | `AB` (hybrid) | `get_prior_weights(scheme='AB')` |
+| `cb-BCD` | `BC` (tier × element) | `get_prior_weights(scheme='BC')` |
+
+### Ablation matrix
+
+```
+                     Prior used in KL regularization
+                     ┌─────┬──────┬──────┬─────┐
+                     │  A  │  AB  │  BC  │  C  │
+   ──────────────────┼─────┼──────┼──────┼─────┤
+   Fixed weights     │cb-A │cb-AB │cb-BC │cb-C │   (D off)
+   (no learning)     │     │      │      │     │
+   ──────────────────┼─────┼──────┼──────┼─────┤
+   Learned weights   │cb-D │cb-ABD│cb-BCD│cb-CD│   (D on, KL prior)
+   (importance head) │     │      │      │     │
+   ──────────────────┴─────┴──────┴──────┴─────┘
+```
+
+(`cb-B` is element-only baseline without distance kernel; not in the matrix
+but available for an ablation against C-only baselines.)
+
+### Common interface
+
+All branches expose the same public API:
+
+```python
+# Dataset side: weights are precomputed once per epoch and cached.
+ds = ProcessedTS1x(...)
+ds.attach_atom_weights(w_min=0.1, lambda_decay=2.0)  # writes data["atom_weights_{0,1,2}"]
+
+# Training side: weights flow into en_sb.forward(...) automatically.
+loss = self.model.forward(batch, atom_weights=batch["atom_weights"])
+# For D-family: pass the prior, the network learns the actual weight.
+loss = self.model.forward(batch, atom_weights_prior=batch["atom_weights"])
+```
+
+### Reproducibility
+
+All training runs use `pl.seed_everything(--seed, workers=True)` (default
+seed = 42). The full resolved CLI config is dumped to
+`{checkpoint_dir}/resolved_config.json` for provenance.
+
 ## Pipeline Context (pipeline_v4)
 
 This OT-FM model is **Stage 2** of a larger explainable activation energy prediction pipeline:

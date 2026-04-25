@@ -17,6 +17,35 @@ except ImportError:
     _RDKIT_AVAILABLE = False
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Covalent radii in Angstroms.
+#
+# Source: Cordero, B. et al. "Covalent radii revisited."
+# Dalton Trans., 2008, 2832-2838. DOI: 10.1039/b801115j
+#
+# Used to detect bonds via the threshold (r_i + r_j) * 1.3, which is the
+# standard practice for empirical bond perception (RDKit also uses ~1.3×
+# sum of covalent radii). The 1.3 multiplier accommodates lengthened bonds
+# in transition states.
+#
+# Halo8 dataset (Lee et al., Sci. Data, 2025; DOI: 10.1038/s41597-025-05944-3)
+# atomic species included: H, C, N, O, F, S, Br. Cl is included here for
+# defensive future-proofing even though Halo8 currently has no Cl reactions.
+# ─────────────────────────────────────────────────────────────────────────
+COVALENT_RADII_ANGSTROM = {
+    1:  0.31,  # H
+    6:  0.76,  # C
+    7:  0.71,  # N
+    8:  0.66,  # O
+    9:  0.57,  # F
+    16: 1.05,  # S
+    17: 1.02,  # Cl  (defensive; not in current Halo8)
+    35: 1.20,  # Br
+}
+# Default for unknown elements: midpoint of typical organic-element range.
+_COVALENT_RADIUS_FALLBACK = 0.77
+
+
 def find_reactive_core_from_smiles(smiles_R: str, smiles_P: str) -> Set[int]:
     """
     R과 P의 SMILES에서 결합 변화(symmetric difference)를 탐지하여
@@ -80,14 +109,14 @@ def find_reactive_core_from_positions(pos_R: np.ndarray, pos_P: np.ndarray,
     dist_P = cdist(pos_P, pos_P)
 
     # 공유결합 반지름 기반 결합 판정 (1.3배 이내)
-    covalent_radii = {1: 0.31, 6: 0.76, 7: 0.71, 8: 0.66,
-                      9: 0.57, 16: 1.05, 17: 1.02, 35: 1.20}
+    # Use the module-level table (with Cordero 2008 citation, DOI: 10.1039/b801115j).
+    covalent_radii = COVALENT_RADII_ANGSTROM
 
     core = set()
     for i in range(N):
         for j in range(i + 1, N):
-            r_cov = covalent_radii.get(int(atomic_numbers[i]), 0.77) + \
-                    covalent_radii.get(int(atomic_numbers[j]), 0.77)
+            r_cov = covalent_radii.get(int(atomic_numbers[i]), _COVALENT_RADIUS_FALLBACK) + \
+                    covalent_radii.get(int(atomic_numbers[j]), _COVALENT_RADIUS_FALLBACK)
 
             bonded_R = dist_R[i, j] < r_cov * 1.3
             bonded_P = dist_P[i, j] < r_cov * 1.3
@@ -157,8 +186,8 @@ def build_adjacency_matrix(positions: np.ndarray, atomic_numbers: np.ndarray) ->
     """
     from scipy.spatial.distance import cdist
 
-    covalent_radii = {1: 0.31, 6: 0.76, 7: 0.71, 8: 0.66,
-                      9: 0.57, 16: 1.05, 17: 1.02, 35: 1.20}
+    # Use the module-level table (with Cordero 2008 citation, DOI: 10.1039/b801115j).
+    covalent_radii = COVALENT_RADII_ANGSTROM
 
     N = positions.shape[0]
     dist = cdist(positions, positions)
@@ -166,8 +195,8 @@ def build_adjacency_matrix(positions: np.ndarray, atomic_numbers: np.ndarray) ->
 
     for i in range(N):
         for j in range(i + 1, N):
-            r_cov = covalent_radii.get(int(atomic_numbers[i]), 0.77) + \
-                    covalent_radii.get(int(atomic_numbers[j]), 0.77)
+            r_cov = covalent_radii.get(int(atomic_numbers[i]), _COVALENT_RADIUS_FALLBACK) + \
+                    covalent_radii.get(int(atomic_numbers[j]), _COVALENT_RADIUS_FALLBACK)
             if dist[i, j] < r_cov * 1.3:
                 adj[i, j] = 1
                 adj[j, i] = 1
@@ -253,19 +282,37 @@ def compute_weights_torch(graph_dist_tensor: torch.Tensor,
 #   - Bondi, J. Phys. Chem. 1964, DOI: 10.1021/j100785a001 (vdW radii)
 #   - Pearson, Inorg. Chem. 1988, DOI: 10.1021/ic00281a023 (HSAB / polarizability)
 
-# 원소별 중요도 계수 α_Z
-# 근거: vdW 반지름과 분극율에 비례하도록 설정
-# H는 자유도가 높지만 TS 정확도 기여가 작으므로 감쇄
-# 할로겐은 분극율 순서대로 Br > Cl > F
+# ─────────────────────────────────────────────────────────────────────────
+# Per-element importance coefficients α_Z for the FM-loss weighting.
+#
+# Design rationale:
+# (a) C is the reference (α=1.0) since it forms the molecular backbone in
+#     all Transition1x and Halo8 reactions.
+# (b) H gets the lowest weight (α=0.5) because hydrogen rotation is largely
+#     irrelevant for transition-state energetics — H atoms have small
+#     polarizability (α_H ≈ 0.667 a.u.) and contribute little to the
+#     reaction coordinate. Polarizability data: Schwerdtfeger & Nagle,
+#     Mol. Phys. 117 (2019), 1200-1225. DOI: 10.1080/00268976.2018.1535143
+# (c) Halogens are ordered by static polarizability (Br > Cl > F):
+#     α_F ≈ 0.557, α_Cl ≈ 2.18, α_Br ≈ 3.05 (atomic units, ibid.).
+#     Larger polarizability → more electron cloud deformation during bond
+#     change → larger contribution to the TS coordinate.
+# (d) N, O are slightly above C due to lone pairs and electronegativity
+#     (relevant for proton-transfer and nucleophilic mechanisms).
+# (e) S is elevated for d-orbital availability and large size.
+#
+# These α_Z values are *priors*; cb-D / cb-CD / cb-ABD / cb-BCD allow the
+# network to refine them via a learnable importance head with KL regularization.
+# ─────────────────────────────────────────────────────────────────────────
 ELEMENT_IMPORTANCE = {
-    1:  0.5,   # H  — 회전 자유도 높고 TS 기여 낮음
-    6:  1.0,   # C  — 기준 원소
-    7:  1.1,   # N  — lone pair, 전기음성도
-    8:  1.1,   # O  — lone pair, 전기음성도
-    9:  1.2,   # F  — 높은 전기음성도, 작은 크기
-    16: 1.3,   # S  — 큰 원자, d-orbital 참여
-    17: 1.3,   # Cl — 중간 분극율 (Halo8에서 Cl은 Z=17)
-    35: 1.4,   # Br — 가장 큰 분극율, steric effect
+    1:  0.5,   # H  — small polarizability, rotation-only DoF
+    6:  1.0,   # C  — backbone reference
+    7:  1.1,   # N  — lone pair, electronegativity
+    8:  1.1,   # O  — lone pair, electronegativity
+    9:  1.2,   # F  — high electronegativity, smallest halogen
+    16: 1.3,   # S  — large atom, d-orbital participation
+    17: 1.3,   # Cl — moderate polarizability (defensive; not in current Halo8)
+    35: 1.4,   # Br — largest polarizability, sterically dominant
 }
 
 # 주의: HALO_ATOM_MAPPING = {1: 0, 6: 1, 7: 2, 8: 3, 9: 4, 16: 5, 17: 6, 35: 7}
@@ -368,16 +415,10 @@ def compute_element_weights_for_batch(
 # DEFAULT_ELEMENT_ALPHA mirrors ELEMENT_IMPORTANCE. It is a separate constant
 # so hybrid-specific tuning does not accidentally shift 1-B's alpha values.
 
-DEFAULT_ELEMENT_ALPHA = {
-    1:  0.5,   # H
-    6:  1.0,   # C (reference)
-    7:  1.1,   # N
-    8:  1.1,   # O
-    9:  1.2,   # F
-    16: 1.3,   # S
-    17: 1.3,   # Cl
-    35: 1.4,   # Br
-}
+# Alias for clarity: the AB/BC hybrid functions accept `element_alpha`
+# (general dict) but default to ELEMENT_IMPORTANCE when None is passed.
+# Keep DEFAULT_ELEMENT_ALPHA as a clear public name for backward compat.
+DEFAULT_ELEMENT_ALPHA = ELEMENT_IMPORTANCE
 
 
 def compute_hybrid_weights(
