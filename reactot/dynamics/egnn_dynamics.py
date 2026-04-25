@@ -5,7 +5,7 @@ import torch
 from torch import nn, Tensor
 from torch_scatter import scatter_mean
 
-from reactot.model import EGNN
+from reactot.model import EGNN, MLP
 from reactot.utils._graph_tools import get_subgraph_mask
 from reactot.model.util_funcs import radius_graph_pbc, get_pbc_distances
 from ._base import BaseDynamics
@@ -29,6 +29,7 @@ class EGNNDynamics(BaseDynamics):
         source: Optional[Dict] = None,
         fixed_idx: Optional[List] = None,
         pbc: bool = False,
+        learn_importance: bool = False,
     ) -> None:
         r"""Base dynamics class set up for denoising process.
 
@@ -64,6 +65,22 @@ class EGNNDynamics(BaseDynamics):
         )
         self.fixed_idx = fixed_idx or []
         self.pbc = pbc
+        self.learn_importance = learn_importance
+
+        # Idea 1-D: per-atom importance head. The MLP consumes the node
+        # features emitted by LEFTNet's final projection (dim=in_hidden_channels)
+        # and outputs one scalar per atom. en_sb.py squashes this with sigmoid
+        # into a [w_min, 1.0] weight for the FM loss, then KL-regularizes
+        # against the BC prior (Idea 1-BCD).
+        if self.learn_importance:
+            in_hidden_channels = int(model_config["in_hidden_channels"])
+            self.importance_head = MLP(
+                in_dim=in_hidden_channels,
+                out_dims=[4 * in_hidden_channels, 2 * in_hidden_channels, 1],
+                activation="swish",
+                bias=True,
+                last_layer_no_activation=True,
+            )
 
     def forward(
         self,
@@ -76,7 +93,7 @@ class EGNNDynamics(BaseDynamics):
         edge_attr: Optional[Tensor] = None,
         natoms: Optional[Tensor] = None,
         pbc: bool = False,
-    ) -> Tuple[List[Tensor], Tensor]:
+    ) -> Tuple[List[Tensor], Optional[Tensor], Optional[List[Tensor]]]:
         r"""predict noise /mu.
 
         Args:
@@ -200,6 +217,14 @@ class EGNNDynamics(BaseDynamics):
             print("Warning: detected nan in h, resetting EGNN output to randn.")
             h_final = torch.randn_like(h_final)
 
+        # Idea 1-D: read per-atom importance logits from h_final *before* the
+        # condition slice, since the importance head expects the full
+        # in_hidden_channels width.
+        if self.learn_importance:
+            importance_logits = self.importance_head(h_final).squeeze(-1)
+        else:
+            importance_logits = None
+
         h_final = h_final[:, :-condition_dim]
 
         frag_index = self.compute_frag_index(n_frag_switch)
@@ -217,19 +242,27 @@ class EGNNDynamics(BaseDynamics):
             for ii, name in enumerate(self.fragment_names)
         ]
 
+        if importance_logits is not None:
+            importance_per_frag = [
+                importance_logits[frag_index[ii] : frag_index[ii + 1]]
+                for ii in range(len(self.fragment_names))
+            ]
+        else:
+            importance_per_frag = None
+
         for ii in self.fixed_idx:
             xh_final[ii] = torch.zeros_like(
                 xh_final[ii][:, :],
                 device=xh_final[ii].device,
             )
-        
+
         # xh_final = self.enpose_pbc(xh_final)
 
         if edge_attr_final is None or edge_attr_final.size(1) <= max(1, self.dist_dim):
             edge_attr_final = None
         else:
             edge_attr_final = self.edge_decoder(edge_attr_final)
-        return xh_final, edge_attr_final
+        return xh_final, edge_attr_final, importance_per_frag
 
     @staticmethod
     def enpose_pbc(xh: List[Tensor], magnitude=10.0) -> List[Tensor]:

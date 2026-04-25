@@ -86,6 +86,45 @@ class BaseDataset(Dataset):
             return out, res["condition"]
         return out, res
 
+    def attach_atom_weights(
+        self,
+        prior_scheme: str = "BC",
+        target_idx: int = 1,
+        r_idx: int = 0,
+        p_idx: int = 2,
+        **prior_kwargs,
+    ) -> None:
+        """Compute per-atom BC-prior weights for every sample and cache them on
+        the target fragment representation under ``atom_weights_<target_idx>``.
+
+        The cached tensor is read by ``EnSB.forward`` at training time:
+        - In the cb-BC baseline (``learn_importance=False``) it is used directly
+          as a fixed weighting on the FM loss.
+        - In the BCD scheme (``learn_importance=True``) it is the reference
+          distribution for the KL regularizer on the learned importance head.
+        """
+        from reactot.utils import get_prior_weights
+
+        if f"pos_{r_idx}" not in self.data or f"pos_{p_idx}" not in self.data:
+            return
+        if f"charge_{target_idx}" not in self.data:
+            return
+
+        pos_r_list = self.data[f"pos_{r_idx}"]
+        pos_p_list = self.data[f"pos_{p_idx}"]
+        charges_list = self.data[f"charge_{target_idx}"]
+
+        weights_list = []
+        for pos_r, pos_p, charges in zip(pos_r_list, pos_p_list, charges_list):
+            z = charges.view(-1).detach().cpu().numpy()
+            pr = pos_r.detach().cpu().numpy()
+            pp = pos_p.detach().cpu().numpy()
+            w = get_prior_weights(pr, pp, z, prior_scheme=prior_scheme, **prior_kwargs)
+            weights_list.append(
+                torch.tensor(w, dtype=torch.float32, device=pos_r.device)
+            )
+        self.data[f"atom_weights_{target_idx}"] = weights_list
+
     def patch_dummy_molecules(self, idx):
         self.data[f"size_{idx}"] = torch.ones_like(
             self.data[f"size_0"], device=self.device,

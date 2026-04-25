@@ -72,6 +72,36 @@ def parse_args(argv=None):
         help="Halo8 only: dand_id prefix filter. 'Mix' accepts both Halogen "
         "and T1x. Falls back to the DATASET_PREFIX env var, then 'Halogen'.",
     )
+    p.add_argument(
+        "--prior-scheme",
+        choices=["A", "AB", "B", "C", "BC", "none"],
+        default=None,
+        help="Per-atom weighting prior for FM loss / KL target. 'none' or "
+        "omitted = uniform (vanilla React-OT). 'BC' is the BCD default "
+        "(tier x alpha_Z + bond-angle). Falls back to PRIOR_SCHEME env var.",
+    )
+    p.add_argument(
+        "--learn-importance",
+        action="store_true",
+        help="Idea 1-D: add a per-atom importance head whose output is KL-"
+        "regularized toward the --prior-scheme prior. Requires "
+        "--prior-scheme to be set. Falls back to LEARN_IMPORTANCE env var.",
+    )
+    p.add_argument(
+        "--kl-weight",
+        type=float,
+        default=None,
+        help="KL regularization weight for the learned importance head. "
+        "Falls back to KL_WEIGHT env var, then 0.1.",
+    )
+    p.add_argument(
+        "--learned-w-min",
+        type=float,
+        default=None,
+        help="Floor weight for the sigmoid-squashed importance head output "
+        "(learned weights lie in [w_min, 1.0]). Falls back to LEARNED_W_MIN "
+        "env var, then 0.1.",
+    )
     args = p.parse_args(argv)
 
     if args.data_dir is None:
@@ -82,6 +112,28 @@ def parse_args(argv=None):
         args.num_workers = int(os.environ["NUM_WORKERS"])
     if args.halo_prefix is None:
         args.halo_prefix = os.environ.get("DATASET_PREFIX", "Halogen")
+
+    if args.prior_scheme is None:
+        args.prior_scheme = os.environ.get("PRIOR_SCHEME")
+    if args.prior_scheme == "none":
+        args.prior_scheme = None
+
+    if not args.learn_importance:
+        env_li = os.environ.get("LEARN_IMPORTANCE", "").lower()
+        if env_li in ("1", "true", "yes"):
+            args.learn_importance = True
+
+    if args.kl_weight is None:
+        env_kl = os.environ.get("KL_WEIGHT")
+        args.kl_weight = float(env_kl) if env_kl is not None else 0.1
+    if args.learned_w_min is None:
+        env_wmin = os.environ.get("LEARNED_W_MIN")
+        args.learned_w_min = float(env_wmin) if env_wmin is not None else 0.1
+
+    if args.learn_importance and args.prior_scheme is None:
+        # BCD requires a KL target; default to 'BC' when D is on but the
+        # user forgot to name the prior.
+        args.prior_scheme = "BC"
 
     return args
 
@@ -166,6 +218,18 @@ def build_configs(args):
         training_config["data_limit"] = args.data_limit
         training_config["single_frag_only"] = False
         training_config["prefix"] = args.halo_prefix
+
+    # BCD prior: cached per-sample by BaseDataset.attach_atom_weights and
+    # consumed by EnSB.forward (either as a fixed FM weight in the cb-BC
+    # baseline or as the KL target when --learn-importance is on).
+    if args.prior_scheme is not None:
+        training_config["prior_scheme"] = args.prior_scheme
+        training_config["prior_kwargs"] = {
+            "w_min": 0.1,
+            "lambda_decay": 2.0,
+            "interface_max_hop": 2,
+            "beta_angle": 1.0,
+        }
 
     # Smoke-test overrides
     if args.smoke_test:
@@ -276,6 +340,9 @@ def main(argv=None):
         inv_power=inv_power,
         sigma=sigma,
         ts_guess=ts_guess,
+        learn_importance=args.learn_importance,
+        kl_weight=args.kl_weight,
+        learned_w_min=args.learned_w_min,
     )
     ddpm.ddpm.opt = opt
 
@@ -352,9 +419,10 @@ def main(argv=None):
             devices = [0]
 
     trainer_kwargs = dict(
-        # max_epochs=1000 for mid-scale runs (DATA_LIMIT=1000, ~11h on A10).
-        # Use 300 for quick iteration (DATA_LIMIT=300, ~1h) or 3000 for full-dataset.
-        max_epochs=1000,
+        # 3000 epochs for full-dataset BCD runs (per markdown spec).
+        # Use 1000 for mid-scale (DATA_LIMIT=1000, ~11h on A10) or 300 for
+        # quick iteration.
+        max_epochs=3000,
         accelerator=accelerator,
         deterministic=False,
         devices=devices,

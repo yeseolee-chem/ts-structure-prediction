@@ -478,6 +478,8 @@ class ProcessedHalo8(Dataset):
         prefix="Halogen",
         seed=None,
         max_db_files=None,
+        prior_scheme: str = None,
+        prior_kwargs: dict = None,
         **kwargs,
     ):
         super().__init__()
@@ -656,6 +658,14 @@ class ProcessedHalo8(Dataset):
             torch.zeros(size=(1, 1), dtype=torch.int64, device=self.device)
             for _ in range(self.n_samples)
         ]
+
+        if prior_scheme is not None:
+            from reactot.dataset.base_dataset import BaseDataset
+            BaseDataset.attach_atom_weights(
+                self,
+                prior_scheme=prior_scheme,
+                **(prior_kwargs or {}),
+            )
 
     def __len__(self):
         return self.n_samples

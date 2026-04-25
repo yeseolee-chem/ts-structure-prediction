@@ -41,6 +41,8 @@ class ProcessedTS1x(BaseDataset):
         ts_guess=False,
         react_type=None,
         atom_mapping=ATOM_MAPPING,
+        prior_scheme: str = None,
+        prior_kwargs: dict = None,
         **kwargs,
     ):
         super().__init__(
@@ -156,3 +158,9 @@ class ProcessedTS1x(BaseDataset):
                 torch.zeros(size=(1, 1), dtype=torch.int64, device=self.device,)
                 for _ in range(self.n_samples)
             ]
+
+        if prior_scheme is not None:
+            self.attach_atom_weights(
+                prior_scheme=prior_scheme,
+                **(prior_kwargs or {}),
+            )
