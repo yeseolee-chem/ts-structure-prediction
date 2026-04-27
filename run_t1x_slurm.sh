@@ -23,7 +23,7 @@
 #SBATCH --partition=gpu6
 #SBATCH --gres=gpu:a10:1
 #SBATCH --mem=64G
-#SBATCH --time=48:00:00
+#SBATCH --time=72:00:00
 
 # =============== SCRIPT_VERSION: reactof-halo8 / self-contained ============
 # If you DO NOT see the line above in the job log, you are running a stale
