@@ -42,8 +42,29 @@ CONDA_ENV=${CONDA_ENV:-"reactot"}
 HALO8_SOURCE=${HALO8_SOURCE:-"$HOME/projects/ts_prediction_project/data"}
 HALO8_DATADIR=${HALO8_DATADIR:-"$REPO_DIR/reactot/dataset/Halo8"}
 
-# ---- Resume from a specific checkpoint (empty = start fresh) ---------------
+# ---- Auto-resume on resubmission ------------------------------------------
+# RUN_NAME keys the checkpoint directory.  When unset, we derive a stable
+# value from DATASET_PREFIX + DATA_LIMIT so re-submitting the same job lands
+# in the same checkpoint dir and can pick up last.ckpt.  Override RUN_NAME
+# (e.g. RUN_NAME=my-fresh-run sbatch ...) to start a clean run.
+RUN_NAME=${RUN_NAME:-"halo8-${DATASET_PREFIX}-dl${DATA_LIMIT}"}
+PROJECT_NAME=${PROJECT_NAME:-"RPSB-FT-Schedule"}
+
+# RESUME_FROM: explicit path wins.  Otherwise auto-detect last.ckpt under
+# the predictable RUN_NAME-keyed checkpoint dir so the job continues from
+# where the previous (walltime-killed) submission left off.
 RESUME_FROM=${RESUME_FROM:-""}
+if [ -z "$RESUME_FROM" ]; then
+    AUTO_CKPT="${REPO_DIR}/checkpoint/${PROJECT_NAME}/${RUN_NAME}/last.ckpt"
+    if [ -f "$AUTO_CKPT" ]; then
+        RESUME_FROM="$AUTO_CKPT"
+        echo "INFO: Auto-resuming from $RESUME_FROM"
+    else
+        echo "INFO: No checkpoint at $AUTO_CKPT — starting fresh"
+    fi
+else
+    echo "INFO: Using explicit RESUME_FROM=$RESUME_FROM"
+fi
 
 # ---- HPC module names — disabled: cluster does not use module load for CUDA/cuDNN/Conda ----
 # CUDA_MODULE=${CUDA_MODULE:-"cuda/11.8"}
@@ -63,6 +84,8 @@ echo "REPO_DIR       : $REPO_DIR"
 echo "CONDA_ENV      : $CONDA_ENV"
 echo "HALO8_SOURCE   : $HALO8_SOURCE"
 echo "HALO8_DATADIR  : $HALO8_DATADIR"
+echo "RUN_NAME       : $RUN_NAME"
+echo "PROJECT_NAME   : $PROJECT_NAME"
 echo "RESUME_FROM    : ${RESUME_FROM:-<none>}"
 echo "=========================================="
 
@@ -164,6 +187,8 @@ export DATASET_PREFIX
 export HALO8_DATADIR
 export NUM_WORKERS
 export RESUME_FROM
+export RUN_NAME
+export PROJECT_NAME
 
 # ===========================================================================
 # Launch training
