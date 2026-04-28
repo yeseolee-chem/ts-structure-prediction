@@ -236,7 +236,13 @@ def main(argv=None):
     sigma: float = 0.0
     ts_guess = None
 
-    run_name = f"{cfgs['model_type']}-{cfgs['version']}-" + str(uuid4()).split("-")[-1]
+    # Use a stable RUN_NAME from env when provided so the checkpoint dir is
+    # predictable across resubmissions. When a SLURM job hits its walltime
+    # and is resubmitted, the new run lands in the same directory and can
+    # resume from last.ckpt. Falls back to a uuid-suffixed name otherwise.
+    run_name = os.environ.get("RUN_NAME") or (
+        f"{cfgs['model_type']}-{cfgs['version']}-" + str(uuid4()).split("-")[-1]
+    )
 
     opt = OPT(solver="ddpm", method="midpoint")
 
@@ -390,7 +396,17 @@ def main(argv=None):
 
     print("config: ", config)
     trainer = Trainer(**trainer_kwargs)
-    trainer.fit(ddpm)
+
+    # Resume from a previous checkpoint when RESUME_FROM is set. PL restores
+    # model weights, optimizer state, scheduler state, and current_epoch — so
+    # training continues from where the previous (walltime-killed) job left off.
+    resume_from = os.environ.get("RESUME_FROM", "").strip() or None
+    if resume_from and not os.path.exists(resume_from):
+        print(f"WARNING: RESUME_FROM={resume_from} not found — starting fresh")
+        resume_from = None
+    if resume_from:
+        print(f"[reactot] Resuming from checkpoint: {resume_from}")
+    trainer.fit(ddpm, ckpt_path=resume_from)
     return trainer
 
 
