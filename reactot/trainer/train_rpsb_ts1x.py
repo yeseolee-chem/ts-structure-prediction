@@ -11,7 +11,7 @@ import torch
 from reactot.trainer.pl_trainer import SBModule
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks.progress import TQDMProgressBar
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger, CSVLogger
 from pytorch_lightning.strategies.ddp import DDPStrategy
 
@@ -167,7 +167,7 @@ def build_configs(args):
     training_config = dict(
         datadir=datadir,
         remove_h=False,
-        bz=14,
+        bz=16,
         num_workers=args.num_workers if args.num_workers is not None else 0,
         clip_grad=True,
         gradient_clip_val=None,
@@ -412,6 +412,15 @@ def main(argv=None):
             # disabled via check_val_every_n_epoch=1e9).
             save_on_train_epoch_end=True,
         ),
+        EarlyStopping(
+            monitor="val_ep_scaled_err",
+            patience=150,
+            mode="min",
+            verbose=True,
+            # val_ep_scaled_err is logged in on_train_epoch_end (manual val);
+            # auto val is disabled via check_val_every_n_epoch=1e9.
+            check_on_train_epoch_end=True,
+        ),
         TQDMProgressBar(),
         LearningRateMonitor(logging_interval="step"),
     ]
@@ -439,7 +448,7 @@ def main(argv=None):
     trainer_kwargs = dict(
         # max_epochs=3000 for full-dataset runs.
         # Use 300 for quick iteration (DATA_LIMIT=300, ~1h) or 1000 for mid-scale (DATA_LIMIT=1000, ~11h on A10).
-        max_epochs=3000,
+        max_epochs=-1,  # Unlimited; bounded by EarlyStopping (patience=150)
         accelerator=accelerator,
         deterministic=False,
         devices=devices,
