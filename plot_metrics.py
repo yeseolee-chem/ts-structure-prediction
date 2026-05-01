@@ -250,6 +250,15 @@ def plot_summary(df: pd.DataFrame, out: Path) -> bool:
 # ---------------------------------------------------------------------------
 # Best-epoch textual summary (handy when you can't open the PNGs remotely)
 # ---------------------------------------------------------------------------
+# Column we use to pick the single "best" epoch. EarlyStopping +
+# ModelCheckpoint both monitor val_ep_scaled_err, so summarizing other
+# metrics at THAT epoch describes the same checkpoint reviewers would
+# evaluate. The previous behavior — picking idxmin per metric — could
+# stitch together numbers from totally different epochs (e.g. RMSD median
+# from epoch 47, RMSD mean from epoch 92), which made the reported summary
+# correspond to no actual saved model.
+MONITOR_COL = "val_ep_scaled_err"
+
 _SUMMARY_COLS = [
     ("val_ep_rmsd_median", "val RMSD median (Å)"),
     ("val_ep_rmsd_mean",   "val RMSD mean (Å)"),
@@ -260,21 +269,66 @@ _SUMMARY_COLS = [
 
 
 def _best_epoch_rows(df: pd.DataFrame):
+    """Report all summary metrics from the best-monitor epoch.
+
+    Returns rows of (label, value, epoch). The chosen epoch is the one
+    that minimizes ``MONITOR_COL`` — same metric EarlyStopping watches —
+    so the reported numbers describe one consistent checkpoint state.
+    """
+    monitor_data = _collapse_by_epoch(df, MONITOR_COL)
+    if monitor_data.empty:
+        # Monitor column wasn't logged → degrade gracefully to per-metric
+        # idxmin so the user still gets something. Mark the rows so the
+        # caller can flag the inconsistency.
+        rows = []
+        for col, label in _SUMMARY_COLS:
+            data = _collapse_by_epoch(df, col)
+            if data.empty:
+                rows.append((label, None, None))
+            else:
+                idx = data[col].idxmin()
+                rows.append(
+                    (label + " (per-metric idxmin — monitor missing)",
+                     float(data.loc[idx, col]),
+                     int(data.loc[idx, "epoch"]))
+                )
+        return rows
+
+    best_idx = monitor_data[MONITOR_COL].idxmin()
+    best_epoch = int(monitor_data.loc[best_idx, "epoch"])
+
     rows = []
     for col, label in _SUMMARY_COLS:
         data = _collapse_by_epoch(df, col)
         if data.empty:
             rows.append((label, None, None))
-        else:
-            idx = data[col].idxmin()
+            continue
+        # Look up this metric at the best-monitor epoch (not its own argmin).
+        match = data[data["epoch"] == best_epoch]
+        if match.empty:
+            # Metric wasn't logged on that exact epoch (e.g. logged every 10
+            # epochs); take the closest available epoch instead.
+            closest_idx = (data["epoch"] - best_epoch).abs().idxmin()
             rows.append(
-                (label, float(data.loc[idx, col]), int(data.loc[idx, "epoch"]))
+                (label,
+                 float(data.loc[closest_idx, col]),
+                 int(data.loc[closest_idx, "epoch"]))
+            )
+        else:
+            rows.append(
+                (label,
+                 float(match.iloc[0][col]),
+                 int(match.iloc[0]["epoch"]))
             )
     return rows
 
 
 def _format_summary(rows, header: str) -> str:
     lines = [f"====== {header} ======"]
+    lines.append(
+        f"  (all metrics taken from the epoch that minimizes "
+        f"{MONITOR_COL!r} — the monitor used by EarlyStopping/ModelCheckpoint)"
+    )
     for label, val, epoch in rows:
         if val is None:
             lines.append(f"  {label:30s} : (not logged)")
