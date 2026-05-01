@@ -43,16 +43,17 @@ class DynamicBatchSampler(Sampler):
             it is be ambiguous. (default: :obj:`None`)
     """
     def __init__(
-        self, 
+        self,
         dataset: Dataset,
-        max_num: int, 
+        max_num: int,
         mode: str = 'node',
-        shuffle: bool = False, 
+        shuffle: bool = False,
         skip_too_big: bool = False,
         num_steps: Optional[int] = None,
         drop_last: bool = True,
         max_batch: Optional[int] = None,
         ddp: bool = False,
+        seed: Optional[int] = None,
         **kwargs
     ):
         if not isinstance(max_num, int) or max_num <= 0:
@@ -63,7 +64,7 @@ class DynamicBatchSampler(Sampler):
             "node": self.node_calc,
             "node^2": self.node_square_calc,
         }
-        
+
         if not mode in self.mode_avail:
             raise ValueError(f"mode {self.mode} is not available.")
         self.mode_calc = self.mode_calc_map[mode]
@@ -80,14 +81,27 @@ class DynamicBatchSampler(Sampler):
         self.num_steps = num_steps
         self.drop_last = drop_last
         self.max_batch = max_batch
+        # Seed handling — used to be hard-coded to 42, which meant every run
+        # (and every sampler instance within a run) saw the EXACT same batch
+        # order. That made train/val mini-batches non-independent across
+        # experiments and hid real model differences during validation.
+        # Now: caller passes an explicit seed (e.g. derived from the global
+        # seed plus a role offset). When None, fall back to torch's default
+        # generator state (which seed_everything has already configured).
+        self._seed = seed
         if not ddp:
+            generator = None
+            if seed is not None:
+                generator = torch.Generator().manual_seed(int(seed))
             self.sampler = RandomSampler(
-                dataset, 
-                generator=torch.Generator().manual_seed(42),
+                dataset,
+                generator=generator,
             )
         else:
             self.sampler = DistributedSampler(
-                dataset, shuffle=shuffle, seed=42,
+                dataset,
+                shuffle=shuffle,
+                seed=(0 if seed is None else int(seed)),
             )
         
         self.batch_size = self.max_num // 400

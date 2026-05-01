@@ -203,9 +203,25 @@ class SBModule(LightningModule):
             )
 
         halo_base_seed = int(self.training_config.get("halo_seed", 42))
+        # Halo8 deterministic-split kwargs. The split assignment is hashed
+        # on dand_id (see ff_lmdb._assign_split), so train/val/test never
+        # overlap regardless of seed/data_limit. The OLD setup just passed
+        # different sampling seeds against the same pool, which let
+        # randomly-overlapping subsets land in train and val.
+        halo_split_kwargs = (
+            dict(
+                val_fraction=float(self.training_config.get("halo_val_fraction", 0.1)),
+                test_fraction=float(self.training_config.get("halo_test_fraction", 0.1)),
+                split_seed=int(self.training_config.get("halo_split_seed", 42)),
+            )
+            if self.process_type == "Halo8" else {}
+        )
 
         if stage == "fit":
-            extra_train = {"seed": halo_base_seed} if self.process_type == "Halo8" else {}
+            extra_train = (
+                {"seed": halo_base_seed, "split": "train", **halo_split_kwargs}
+                if self.process_type == "Halo8" else {}
+            )
             self.train_dataset = func(
                 _data_path("train"),
                 # device=device,
@@ -214,7 +230,8 @@ class SBModule(LightningModule):
             )
             self.training_config["reflection"] = False  # Turn off reflection in val.
             extra_val = (
-                {"seed": halo_base_seed + 1} if self.process_type == "Halo8" else {}
+                {"seed": halo_base_seed + 1, "split": "val", **halo_split_kwargs}
+                if self.process_type == "Halo8" else {}
             )
             self.val_dataset = func(
                 _data_path("valid"),
@@ -233,6 +250,12 @@ class SBModule(LightningModule):
             if self.training_config["use_sampler"]:
                 _config = self.training_config["sampler_config"].copy()
                 _config["max_num"] = int(_config["max_num"] * 3)
+                # Pass an explicit val seed so the val loader is reproducible
+                # WITHOUT colliding with the train sampler (used to be a
+                # hard-coded 42 for both — see sampler.py). This keeps val
+                # batch order stable across epochs/runs while letting train
+                # use a different, freshly-derived generator.
+                _config.setdefault("seed", halo_base_seed + 11)
                 sampler = DynamicBatchSampler(
                     dataset=val_dataset_no_swap,
                     max_batch=100,  # This is hard coded.
@@ -258,7 +281,8 @@ class SBModule(LightningModule):
             else:
                 test_path = Path(self.training_config["datadir"], f"test{ft}")
             extra_test = (
-                {"seed": halo_base_seed + 2} if self.process_type == "Halo8" else {}
+                {"seed": halo_base_seed + 2, "split": "test", **halo_split_kwargs}
+                if self.process_type == "Halo8" else {}
             )
             self.test_dataset = func(
                 test_path,
@@ -270,10 +294,15 @@ class SBModule(LightningModule):
             raise NotImplementedError
 
     def train_dataloader(self, bz: Optional[int] = None) -> DataLoader:
+        halo_base_seed = int(self.training_config.get("halo_seed", 42))
         if self.training_config["use_sampler"]:
+            _config = self.training_config["sampler_config"].copy()
+            # Train sampler seed = halo_base_seed. Decoupled from val seed
+            # below so train/val see independent permutations.
+            _config.setdefault("seed", halo_base_seed)
             sampler = DynamicBatchSampler(
                 dataset=self.train_dataset,
-                **self.training_config["sampler_config"],
+                **_config,
             )
             return DataLoader(
                 self.train_dataset,
@@ -291,9 +320,13 @@ class SBModule(LightningModule):
         )
 
     def val_dataloader(self, bz: Optional[int] = None, shuffle: bool = True,) -> DataLoader:
+        halo_base_seed = int(self.training_config.get("halo_seed", 42))
         if self.training_config["use_sampler"]:
             _config = self.training_config["sampler_config"].copy()
             _config["max_num"] = int(_config["max_num"] * 3)
+            # Val sampler seed = halo_base_seed + 11. Different offset from
+            # train so the val batch order is independent and reproducible.
+            _config.setdefault("seed", halo_base_seed + 11)
             sampler = DynamicBatchSampler(
                 dataset=self.val_dataset,
                 **_config,
@@ -446,9 +479,24 @@ class SBModule(LightningModule):
         for k, v in info.items():
             ip[f"{prefix}_{k}"] = v.item()
 
-        if (self.current_epoch + 1) % self.eval_epochs == 0 and batch_idx == 0:
-            if self.trainer.is_global_zero:
-                print("evaluation on samping for validation batch...", batch[0][0]["size"].shape, batch_idx)
+        # Compute RMSD on EVERY val/test batch (not just batch_idx == 0).
+        #
+        # Was: `if (epoch+1) % eval_epochs == 0 and batch_idx == 0` — which
+        # meant val_rmsd_* aggregated by `average_over_batch_metrics` only
+        # ever saw batch 0 (because batches 1..N had NaN values that the
+        # aggregator skips and the value at ii==0 is taken verbatim — see
+        # reactot/trainer/_metrics.py). With limit_val_batches=20 and DDP-
+        # style dynamic batching that's ~3-7 reactions reported as the
+        # entire val set's RMSD — statistically meaningless and identical
+        # across runs that share a val split (because the sampler used to be
+        # hard-seeded). Now we spend the extra forward passes to get a real
+        # number.
+        if (self.current_epoch + 1) % self.eval_epochs == 0:
+            if self.trainer.is_global_zero and batch_idx == 0:
+                print(
+                    "evaluation on samping for validation batch...",
+                    batch[0][0]["size"].shape, batch_idx,
+                )
             res = self.eval_sample_batch(batch)
             for k, v in res.items():
                 ip[f"{prefix}_{k}"] = v
