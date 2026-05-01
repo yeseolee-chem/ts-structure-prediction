@@ -42,13 +42,46 @@ CONDA_ENV=${CONDA_ENV:-"reactot"}
 HALO8_SOURCE=${HALO8_SOURCE:-"$HOME/projects/ts_prediction_project/data"}
 HALO8_DATADIR=${HALO8_DATADIR:-"$REPO_DIR/reactot/dataset/Halo8"}
 
+# ---- Branch / experiment identifier ---------------------------------------
+# EXPERIMENT_ID disambiguates checkpoint directories across experimental
+# branches that share the same DATASET_PREFIX/DATA_LIMIT. Without it,
+# `reactot-halo8 mix dl500` and `cb-D mix dl500` both resolved to the same
+# RUN_NAME ("halo8-Mix-dl500") and clobbered each other's last.ckpt — which
+# is why their reported val_rmsd numbers were bit-identical.
+#
+# Default: derive from the current git branch (reactot-halo8, cb-A, cb-D, …).
+# Override with EXPERIMENT_ID=<tag> sbatch ... to use a custom label.
+EXPERIMENT_ID=${EXPERIMENT_ID:-"$(cd "$REPO_DIR" 2>/dev/null && git rev-parse --abbrev-ref HEAD 2>/dev/null | tr '/' '-' || echo 'unknown-branch')"}
+
 # ---- Auto-resume on resubmission ------------------------------------------
 # RUN_NAME keys the checkpoint directory.  When unset, we derive a stable
-# value from DATASET_PREFIX + DATA_LIMIT so re-submitting the same job lands
-# in the same checkpoint dir and can pick up last.ckpt.  Override RUN_NAME
-# (e.g. RUN_NAME=my-fresh-run sbatch ...) to start a clean run.
-RUN_NAME=${RUN_NAME:-"halo8-${DATASET_PREFIX}-dl${DATA_LIMIT}"}
+# value from DATASET_PREFIX + DATA_LIMIT + EXPERIMENT_ID so re-submitting
+# the SAME job (same branch, same prefix, same limit) lands in the same
+# checkpoint dir and can pick up last.ckpt — but DIFFERENT branches keep
+# their checkpoints separate. Override RUN_NAME (e.g. RUN_NAME=my-fresh-run
+# sbatch ...) to start a clean run.
+RUN_NAME=${RUN_NAME:-"halo8-${DATASET_PREFIX}-dl${DATA_LIMIT}-${EXPERIMENT_ID}"}
 PROJECT_NAME=${PROJECT_NAME:-"RPSB-FT-Schedule"}
+
+# ---- EarlyStopping defaults ------------------------------------------------
+# Branches with weighted/hierarchical losses (cb-BC, cb-CD, plus the
+# combined BCD/ABD variants) have noisier val_ep_scaled_err curves than
+# vanilla MSE. Without min_delta, the metric keeps making microscopic
+# "improvements" forever and EarlyStopping never fires — combined with
+# max_epochs=-1 that means training runs indefinitely (we observed cb-BC /
+# cb-CD still going at 14h while cb-A/B/C/D finished in 4-6h). A tiny
+# positive min_delta forces a real improvement threshold.
+#
+# Override at submit time:  EARLY_STOP_MIN_DELTA=2e-4 sbatch ...
+case "$EXPERIMENT_ID" in
+    cb-BC|cb-CD|cb-BCD|cb-ABD)
+        EARLY_STOP_MIN_DELTA=${EARLY_STOP_MIN_DELTA:-1e-4}
+        ;;
+    *)
+        EARLY_STOP_MIN_DELTA=${EARLY_STOP_MIN_DELTA:-0.0}
+        ;;
+esac
+EARLY_STOP_PATIENCE=${EARLY_STOP_PATIENCE:-150}
 
 # RESUME_FROM: explicit path wins.  Otherwise auto-detect last.ckpt under
 # the predictable RUN_NAME-keyed checkpoint dir so the job continues from
@@ -86,6 +119,8 @@ echo "HALO8_SOURCE   : $HALO8_SOURCE"
 echo "HALO8_DATADIR  : $HALO8_DATADIR"
 echo "RUN_NAME       : $RUN_NAME"
 echo "PROJECT_NAME   : $PROJECT_NAME"
+echo "EXPERIMENT_ID  : $EXPERIMENT_ID"
+echo "EARLY_STOP     : patience=$EARLY_STOP_PATIENCE min_delta=$EARLY_STOP_MIN_DELTA"
 echo "RESUME_FROM    : ${RESUME_FROM:-<none>}"
 echo "=========================================="
 
@@ -189,6 +224,9 @@ export NUM_WORKERS
 export RESUME_FROM
 export RUN_NAME
 export PROJECT_NAME
+export EARLY_STOP_MIN_DELTA
+export EARLY_STOP_PATIENCE
+export EXPERIMENT_ID
 
 # ===========================================================================
 # Launch training

@@ -4,9 +4,31 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 
 import torch
+
+
+def _git_branch_tag() -> str:
+    """Best-effort git branch identifier for run_name disambiguation.
+
+    Falls back to "unknown-branch" when git/repo is not available. The
+    point is to ensure two different experimental branches (reactot-halo8,
+    cb-A, cb-D, ...) cannot accidentally share a checkpoint directory and
+    overwrite each other's last.ckpt — which previously caused the
+    bit-identical val_rmsd numbers across runs.
+    """
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        return out.replace("/", "-") or "unknown-branch"
+    except Exception:
+        return "unknown-branch"
 
 from reactot.trainer.pl_trainer import SBModule
 from pytorch_lightning import Trainer, seed_everything
@@ -314,9 +336,26 @@ def main(argv=None):
     # predictable across resubmissions. When a SLURM job hits its walltime
     # and is resubmitted, the new run lands in the same directory and can
     # resume from last.ckpt. Falls back to a uuid-suffixed name otherwise.
-    run_name = os.environ.get("RUN_NAME") or (
-        f"{cfgs['model_type']}-{cfgs['version']}-" + str(uuid4()).split("-")[-1]
-    )
+    #
+    # Branch tag is appended to BOTH the env path and the uuid path so that
+    # two branches running the same DATASET_PREFIX/DATA_LIMIT cannot collide
+    # on a checkpoint directory (was the root cause of identical val_rmsd
+    # across reactot-halo8/cb-D Mix and reactot-halo8 T1x/cb-BCD).
+    branch_tag = _git_branch_tag()
+    env_run_name = os.environ.get("RUN_NAME")
+    if env_run_name:
+        # Only append the branch tag if it isn't already present, so
+        # callers (e.g. run_halo8_slurm.sh, which now includes it) don't
+        # get a doubled suffix like "halo8-Mix-dl500-cb-D-cb-D".
+        if branch_tag and branch_tag not in env_run_name:
+            run_name = f"{env_run_name}-{branch_tag}"
+        else:
+            run_name = env_run_name
+    else:
+        run_name = (
+            f"{cfgs['model_type']}-{cfgs['version']}-{branch_tag}-"
+            + str(uuid4()).split("-")[-1]
+        )
 
     opt = OPT(solver="ddpm", method="midpoint")
 
@@ -424,11 +463,25 @@ def main(argv=None):
     except (OSError, TypeError) as e:
         print(f"[reactot] WARNING: could not dump resolved config: {e}")
 
+    # Embed the branch tag in the checkpoint FILENAME too (not just the
+    # directory). Belt-and-suspenders against the historical bug where
+    # multiple branches resolved to the same RUN_NAME — even if dirs
+    # somehow collide, filenames would still be unique.
+    ckpt_filename = f"sb-{branch_tag}-{{epoch:03d}}-{{val_ep_scaled_err:.4f}}"
+
+    # EarlyStopping configuration. min_delta defaults to 0 (strict
+    # improvement), but cb-BC / cb-CD have noisier weighted-MSE loss
+    # surfaces that can keep wiggling forever — they use a small positive
+    # min_delta so EarlyStopping actually fires before max_epochs=-1 turns
+    # into "train indefinitely". Tunable via EARLY_STOP_MIN_DELTA env var.
+    early_stop_min_delta = float(os.environ.get("EARLY_STOP_MIN_DELTA", "0.0"))
+    early_stop_patience = int(os.environ.get("EARLY_STOP_PATIENCE", "150"))
+
     callbacks = [
         ModelCheckpoint(
             monitor="val_ep_scaled_err",
             dirpath=ckpt_path,
-            filename="sb-{epoch:03d}-{val_ep_scaled_err:.4f}",
+            filename=ckpt_filename,
             every_n_epochs=save_epochs,
             save_top_k=3,
             # Always keep a 'last.ckpt' as a safety net — even if the monitor
@@ -443,7 +496,8 @@ def main(argv=None):
         ),
         EarlyStopping(
             monitor="val_ep_scaled_err",
-            patience=150,
+            patience=early_stop_patience,
+            min_delta=early_stop_min_delta,
             mode="min",
             verbose=True,
             # val_ep_scaled_err is logged in on_train_epoch_end (manual val);
