@@ -86,6 +86,24 @@ def space_indices(num_steps, count):
 
 
 def idpp_guess(r_pos, p_pos, x0_size, x0_other, n_images=3, interpolate="idpp"):
+    if interpolate == "ic":
+        from reactot.utils.initial_guess import compute_ic_interpolation
+
+        split_indices = torch.cumsum(x0_size, dim=0).cpu().tolist()[:-1]
+        _r_pos = torch.tensor_split(r_pos, split_indices)
+        _p_pos = torch.tensor_split(p_pos, split_indices)
+        z_split = torch.tensor_split(x0_other[:, -1], split_indices)
+        z_list = [_z.long().cpu().numpy() for _z in z_split]
+
+        ts_pos = []
+        for x_r, x_p, atom_number in zip(_r_pos, _p_pos, z_list):
+            x0 = compute_ic_interpolation(
+                x_r.cpu().numpy(), x_p.cpu().numpy(), atom_number,
+            )
+            ts_pos.append(torch.tensor(x0, dtype=torch.float32))
+
+        return torch.concat(ts_pos).to(x0_size.device)
+
     _r_pos = torch.tensor_split(
         r_pos,
         torch.cumsum(x0_size, dim=0).to("cpu")[:-1]
@@ -126,7 +144,7 @@ def idpp_guess(r_pos, p_pos, x0_size, x0_other, n_images=3, interpolate="idpp"):
         elif interpolate == "linear":
             neb.interpolate('linear')
         else:
-            raise ValueError("interpolate can only be idpp or linear")
+            raise ValueError("interpolate can only be idpp, linear, or ic")
         x_ts = torch.tensor(
             neb.images[n_images // 2].arrays["positions"],
             dtype=torch.float32,
