@@ -6,6 +6,7 @@ LICENSE file in the root directory of this source tree.
 """
 
 import bisect
+import hashlib
 import json as _json
 import logging
 import pickle
@@ -146,6 +147,46 @@ def _normalize_prefix(prefix):
             return ("Halogen", "T1x")
         return (prefix,)
     return tuple(prefix)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic train / val / test split for Halo8.
+#
+# Why this exists: the previous Halo8 setup pointed train and val datasets at
+# the SAME directory and "split" them only by passing different sampling
+# seeds (seed=42 for train, seed=43 for val). With a finite pool, two
+# independent random samples DO overlap — for data_limit=500 and a pool of
+# 2,000 reactions you expect ~25% of the val set to also appear in train.
+# That inflates val metrics and makes generalization claims unreliable.
+#
+# Fix: assign each reaction group to a split *deterministically* by hashing
+# the base reaction ID (dand_id with conformer suffix stripped). The hash
+# bucket lives in [0, 1); thresholds carve out test/val/train slices that
+# never overlap regardless of how data_limit or sampling seed change.
+# ---------------------------------------------------------------------------
+SPLIT_NAMES = ("all", "train", "val", "test")
+
+
+def _assign_split(
+    base_rxn: str,
+    val_fraction: float,
+    test_fraction: float,
+    split_seed: int = 42,
+) -> str:
+    """Hash-based deterministic train/val/test assignment.
+
+    Returns one of ``"train" | "val" | "test"``. Same input always returns
+    the same split; a given reaction is therefore in exactly one set, full
+    stop. Adding/removing data files does not move existing reactions
+    across splits.
+    """
+    h = hashlib.sha256(f"{int(split_seed)}:{base_rxn}".encode("utf-8")).hexdigest()
+    bucket = int(h[:8], 16) / float(1 << 32)  # uniform in [0, 1)
+    if bucket < float(test_fraction):
+        return "test"
+    if bucket < float(test_fraction) + float(val_fraction):
+        return "val"
+    return "train"
 
 
 def _index_rxn_groups(
@@ -478,6 +519,10 @@ class ProcessedHalo8(Dataset):
         prefix="Halogen",
         seed=None,
         max_db_files=None,
+        split: str = "all",
+        val_fraction: float = 0.1,
+        test_fraction: float = 0.1,
+        split_seed: int = 42,
         graph_weights_enabled: bool = True,
         graph_weights_w_min: float = 0.1,
         graph_weights_lambda: float = 2.0,
@@ -489,6 +534,27 @@ class ProcessedHalo8(Dataset):
         # Normalize string like "Mix" → tuple form once, so both the
         # per-file scan path and any downstream logic see the same value.
         prefix = _normalize_prefix(prefix)
+
+        # Validate split kwargs early — silent typos here would silently
+        # disable the split (everything would land in "train").
+        if split not in SPLIT_NAMES:
+            raise ValueError(
+                f"Unknown split={split!r}. Expected one of {SPLIT_NAMES}."
+            )
+        val_fraction = float(val_fraction)
+        test_fraction = float(test_fraction)
+        if not (0.0 <= val_fraction < 1.0 and 0.0 <= test_fraction < 1.0):
+            raise ValueError(
+                "val_fraction and test_fraction must each be in [0, 1)."
+            )
+        if val_fraction + test_fraction >= 1.0:
+            raise ValueError(
+                "val_fraction + test_fraction must be < 1 to leave a train slice."
+            )
+        self.split = split
+        self.val_fraction = val_fraction
+        self.test_fraction = test_fraction
+        self.split_seed = int(split_seed)
 
         self.center = center
         self.device = device
@@ -531,11 +597,24 @@ class ProcessedHalo8(Dataset):
 
         global_groups: dict = {}
 
+        # The early-termination per-file cap was based on per_prefix_limit
+        # alone. With deterministic splits we now also need enough candidates
+        # to survive the split filter — only ~val_fraction of scanned
+        # reactions land in the val set, so we have to scan more rows up
+        # front. Rather than guess a multiplier, drop the cap entirely when
+        # split != "all" (val/test), so we scan every file. When split=="all"
+        # or "train" the original 3× cap is plenty (train fraction is
+        # large).
+        scan_full = self.split in ("val", "test")
+
         for single_prefix in prefix:
             prefix_groups: dict = {}
             # Cap per-file scan to 3× the quota for this prefix so we don't
             # read the whole (multi-million row) file when data_limit is small.
-            per_file_cap = per_prefix_limit * 3 if per_prefix_limit is not None else None
+            per_file_cap = (
+                None if scan_full
+                else (per_prefix_limit * 3 if per_prefix_limit is not None else None)
+            )
 
             for db_idx, db_path in enumerate(db_paths):
                 rxn_groups, _total, _matched = _index_rxn_groups(
@@ -547,18 +626,44 @@ class ProcessedHalo8(Dataset):
                         entries.append((db_idx, row_id, conf_idx, energy))
                 # Early termination: once we have enough candidates for this
                 # prefix, stop scanning further files.
-                if per_prefix_limit is not None and len(prefix_groups) >= per_prefix_limit * 3:
+                if (
+                    not scan_full
+                    and per_prefix_limit is not None
+                    and len(prefix_groups) >= per_prefix_limit * 3
+                ):
                     break
 
-            # Randomly sample per_prefix_limit groups from this prefix.
-            prefix_keys = sorted(prefix_groups.keys())
-            if per_prefix_limit is not None and per_prefix_limit < len(prefix_keys):
-                sampled = rng.sample(prefix_keys, per_prefix_limit)
+            # Filter by deterministic split assignment BEFORE the random
+            # data_limit sampling. This guarantees train/val/test are
+            # disjoint regardless of (seed, data_limit, prefix) settings.
+            if self.split == "all":
+                split_keys = sorted(prefix_groups.keys())
             else:
-                sampled = prefix_keys
+                split_keys = sorted(
+                    k for k in prefix_groups
+                    if _assign_split(
+                        k, self.val_fraction, self.test_fraction, self.split_seed
+                    ) == self.split
+                )
             logger.info(
-                "prefix=%s: %d candidate groups, selected %d",
-                single_prefix, len(prefix_keys), len(sampled),
+                "prefix=%s split=%s: %d/%d groups after deterministic split",
+                single_prefix, self.split, len(split_keys), len(prefix_groups),
+            )
+
+            # Randomly sample per_prefix_limit groups from the split.
+            if per_prefix_limit is not None and per_prefix_limit < len(split_keys):
+                sampled = rng.sample(split_keys, per_prefix_limit)
+            else:
+                sampled = split_keys
+                if per_prefix_limit is not None and per_prefix_limit > len(split_keys):
+                    logger.warning(
+                        "prefix=%s split=%s: data_limit/prefix=%d > split size=%d; "
+                        "using all available split members",
+                        single_prefix, self.split, per_prefix_limit, len(split_keys),
+                    )
+            logger.info(
+                "prefix=%s split=%s: %d candidate groups, selected %d",
+                single_prefix, self.split, len(split_keys), len(sampled),
             )
             for k in sampled:
                 global_groups[k] = prefix_groups[k]
