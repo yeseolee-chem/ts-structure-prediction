@@ -258,6 +258,19 @@ def main(argv=None):
     sigma: float = 0.0
     ts_guess = None
 
+    # Idea 2-A v2: initial-structure config (x_0 generation).
+    # Replaces the (R+P)/2 midpoint with an IDPP-optimised initial guess
+    # carrying a halogen-aware clash penalty (Bondi vdW radii). Set
+    # x0_method="midpoint" to recover the original behaviour.
+    x0_config = {
+        'x0_method': 'idpp_clash',   # "midpoint" | "idpp" | "idpp_clash"
+        'idpp_max_iter': 200,
+        'idpp_tol': 0.01,
+        'idpp_lr': 0.01,
+        'clash_kappa': 10.0,
+        'use_clash_penalty': True,
+    }
+
     # Use a stable RUN_NAME from env when provided so the checkpoint dir is
     # predictable across resubmissions. When a SLURM job hits its walltime
     # and is resubmitted, the new run lands in the same directory and can
@@ -321,6 +334,7 @@ def main(argv=None):
         inv_power=inv_power,
         sigma=sigma,
         ts_guess=ts_guess,
+        **x0_config,
     )
     ddpm.ddpm.opt = opt
 

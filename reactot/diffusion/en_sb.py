@@ -48,6 +48,12 @@ class EnSB(nn.Module):
         sigma: float = 0.0,
         ts_guess: bool = False,
         idx: int = 1,
+        x0_method: str = "midpoint",
+        idpp_max_iter: int = 200,
+        idpp_tol: float = 0.01,
+        idpp_lr: float = 0.01,
+        clash_kappa: float = 10.0,
+        use_clash_penalty: bool = True,
     ):
         super().__init__()
         assert loss_type in {"vlb", "l2"}
@@ -72,6 +78,19 @@ class EnSB(nn.Module):
         self.sigma = sigma
         self.ts_guess = ts_guess
         self.idx = idx
+
+        # Idea 2-A v2: initial-structure (x_0) configuration.
+        # x0_method ∈ {"midpoint", "idpp", "idpp_clash"}.
+        # Only takes effect for mapping="R+P->TS" with mapping_initial="RP";
+        # other mapping_initial paths keep their existing semantics.
+        if x0_method not in {"midpoint", "idpp", "idpp_clash"}:
+            raise ValueError(f"Unknown x0_method: {x0_method}")
+        self.x0_method = x0_method
+        self.idpp_max_iter = idpp_max_iter
+        self.idpp_tol = idpp_tol
+        self.idpp_lr = idpp_lr
+        self.clash_kappa = clash_kappa
+        self.use_clash_penalty = use_clash_penalty
         
         if idx == 1:
             assert mapping.split(">")[-1] == "TS"
@@ -81,6 +100,30 @@ class EnSB(nn.Module):
             assert mapping.split(">")[-1] == "R"
         else:
             pass
+
+    def _compute_x0(self, pos_R, pos_P, x0_size, x0_other):
+        """
+        Compute the OT-FM initial guess x_0.
+
+        x0_method:
+            - "midpoint"   : (R+P)/2
+            - "idpp"       : ASE NEB IDPP (legacy)
+            - "idpp_clash" : in-house IDPP + halogen-aware clash penalty
+        """
+        if self.x0_method == "midpoint":
+            return 0.5 * (pos_R + pos_P)
+        elif self.x0_method in ("idpp", "idpp_clash"):
+            return utils.idpp_guess(
+                pos_R, pos_P, x0_size, x0_other,
+                interpolate=self.x0_method,
+                use_clash_penalty=self.use_clash_penalty,
+                idpp_max_iter=self.idpp_max_iter,
+                idpp_tol=self.idpp_tol,
+                idpp_lr=self.idpp_lr,
+                clash_kappa=self.clash_kappa,
+            )
+        else:
+            raise ValueError(f"Unknown x0_method: {self.x0_method}")
 
     # ------ FORWARD PASS ------
     def sample_batch(
@@ -125,7 +168,9 @@ class EnSB(nn.Module):
                 #     x1 = r_pos * factor + p_pos * (1 - factor)
                 # else:
                 #     x1 = (r_pos+p_pos) / 2
-                x1 = (r_pos+p_pos) / 2
+                # Idea 2-A v2: route through x0_method
+                # ("midpoint" preserves prior (R+P)/2 behaviour exactly)
+                x1 = self._compute_x0(r_pos, p_pos, r_size, r_other)
             elif self.mapping_initial == 'GUESS' and self.ts_guess:
                 x1 = conditions["ts_guess"].float().to(r_pos.device)
             elif self.mapping_initial == 'R':
