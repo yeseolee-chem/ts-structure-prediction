@@ -1,0 +1,40 @@
+# Python bytecode caches.
+#
+# Why this matters: previously the repo committed __pycache__/*.pyc files,
+# so every `git checkout` shipped a stale .pyc snapshot from an old commit.
+# When new keywords/imports landed in the .py source (e.g. learn_importance
+# in egnn_dynamics.py, ELEMENT_IMPORTANCE in weighting.py), Python could
+# still load the OLD .pyc and crash with errors like:
+#   TypeError: EGNNDynamics.__init__() got an unexpected keyword argument 'learn_importance'
+#   ImportError: cannot import name 'ELEMENT_IMPORTANCE' from 'reactot.utils.weighting'
+# Excluding them here + `git rm --cached -r **/__pycache__` makes the
+# bytecode strictly machine-local, where it belongs.
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build / packaging
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Run artifacts (these can grow huge — keep them local)
+checkpoint/
+logs/
+results/
+wandb/
+ref_ts/
+sb/
