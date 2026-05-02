@@ -27,6 +27,11 @@
 # To use the full dataset:    DATA_LIMIT=0 sbatch ...
 # ===========================================================================
 
+echo ">>> run_halo8_slurm.sh VERSION: reactof-halo8 self-contained (unique-RUN_NAME)"
+
+# ---- Wrapper identity ------------------------------------------------------
+WRAPPER_TAG="halo8"
+
 # ---- Data / paths ----------------------------------------------------------
 DATA_LIMIT=${DATA_LIMIT:-300}      # reaction groups to sample; 0 = full dataset
                                     # 300 + 300 epochs ≈ 1h on A10 (iteration)
@@ -34,6 +39,7 @@ DATA_LIMIT=${DATA_LIMIT:-300}      # reaction groups to sample; 0 = full dataset
 DATASET_PREFIX=${DATASET_PREFIX:-"Halogen"}   # "Halogen", "T1x", or "Mix"
 REPO_DIR=${REPO_DIR:-"${SLURM_SUBMIT_DIR:-$(pwd)}"}
 CONDA_ENV=${CONDA_ENV:-"reactot"}
+PROJECT_NAME=${PROJECT_NAME:-"RPSB-FT-Schedule"}
 
 # Canonical data location on UBAI: ~/projects/ts_prediction_project/data
 # The trainer's default path is <repo>/reactot/dataset/Halo8 — we symlink the
@@ -53,15 +59,30 @@ HALO8_DATADIR=${HALO8_DATADIR:-"$REPO_DIR/reactot/dataset/Halo8"}
 # Override with EXPERIMENT_ID=<tag> sbatch ... to use a custom label.
 EXPERIMENT_ID=${EXPERIMENT_ID:-"$(cd "$REPO_DIR" 2>/dev/null && git rev-parse --abbrev-ref HEAD 2>/dev/null | tr '/' '-' || echo 'unknown-branch')"}
 
-# ---- Auto-resume on resubmission ------------------------------------------
-# RUN_NAME keys the checkpoint directory.  When unset, we derive a stable
-# value from DATASET_PREFIX + DATA_LIMIT + EXPERIMENT_ID so re-submitting
-# the SAME job (same branch, same prefix, same limit) lands in the same
-# checkpoint dir and can pick up last.ckpt — but DIFFERENT branches keep
-# their checkpoints separate. Override RUN_NAME (e.g. RUN_NAME=my-fresh-run
-# sbatch ...) to start a clean run.
-RUN_NAME=${RUN_NAME:-"halo8-${DATASET_PREFIX}-dl${DATA_LIMIT}-${EXPERIMENT_ID}"}
-PROJECT_NAME=${PROJECT_NAME:-"RPSB-FT-Schedule"}
+# ---- Globally unique JOB_TAG ----------------------------------------------
+# SLURM_JOB_ID is unique across the cluster, so embedding it in RUN_NAME
+# guarantees no two parallel jobs ever share a checkpoint dir even with the
+# SAME wrapper, prefix, data limit, and branch — which used to happen when
+# 3 parallel `sbatch run_halo8_slurm.sh` invocations all resolved to
+# "halo8-Mix-dl500-cb-D" and stomped on each other's last.ckpt. The 8-char
+# random suffix is a belt-and-suspenders safety net for non-SLURM smoke
+# tests where SLURM_JOB_ID is unset, and for the unlikely case of two jobs
+# on different clusters / partitions sharing a numeric id.
+JOB_TAG_ID=${SLURM_JOB_ID:-local}
+JOB_TAG_RAND=$(python -c 'import uuid; print(uuid.uuid4().hex[:8])' 2>/dev/null || printf '%s%s' "$$" "$(date +%N 2>/dev/null | head -c 6)")
+JOB_TAG="job${JOB_TAG_ID}-${JOB_TAG_RAND}"
+
+# ---- Stable resume key + globally unique RUN_NAME -------------------------
+# STABLE_KEY identifies "the same logical experiment" — wrapper + dataset +
+# data limit + branch — independent of which SLURM job processed it. Used
+# below to find a previous run's last.ckpt for auto-resume on resubmission.
+#
+# RUN_NAME embeds JOB_TAG so parallel submissions with identical params
+# never share a checkpoint dir. Override RUN_NAME=... at submit time only
+# when you intentionally want to write into a specific directory (e.g.
+# resume into one).
+STABLE_KEY="${WRAPPER_TAG}-${DATASET_PREFIX}-dl${DATA_LIMIT}-${EXPERIMENT_ID}"
+RUN_NAME=${RUN_NAME:-"${STABLE_KEY}-${JOB_TAG}"}
 
 # ---- EarlyStopping defaults ------------------------------------------------
 # Branches with weighted/hierarchical losses (cb-BC, cb-CD, plus the
@@ -83,17 +104,27 @@ case "$EXPERIMENT_ID" in
 esac
 EARLY_STOP_PATIENCE=${EARLY_STOP_PATIENCE:-150}
 
-# RESUME_FROM: explicit path wins.  Otherwise auto-detect last.ckpt under
-# the predictable RUN_NAME-keyed checkpoint dir so the job continues from
-# where the previous (walltime-killed) submission left off.
+# ---- Auto-resume on resubmission ------------------------------------------
+# Explicit RESUME_FROM wins. Otherwise scan
+# checkpoint/${PROJECT_NAME}/${STABLE_KEY}-job*/last.ckpt and pick the most
+# recent. Because every submission gets a fresh JOB_TAG suffix, we can no
+# longer rely on an exact RUN_NAME match — but the STABLE_KEY prefix still
+# unambiguously identifies "the same logical experiment", so picking the
+# newest matching last.ckpt is the right resume target.
 RESUME_FROM=${RESUME_FROM:-""}
 if [ -z "$RESUME_FROM" ]; then
-    AUTO_CKPT="${REPO_DIR}/checkpoint/${PROJECT_NAME}/${RUN_NAME}/last.ckpt"
-    if [ -f "$AUTO_CKPT" ]; then
-        RESUME_FROM="$AUTO_CKPT"
+    LATEST_CKPT=""
+    for ckpt in "${REPO_DIR}/checkpoint/${PROJECT_NAME}/${STABLE_KEY}-"*/last.ckpt; do
+        [ -f "$ckpt" ] || continue
+        if [ -z "$LATEST_CKPT" ] || [ "$ckpt" -nt "$LATEST_CKPT" ]; then
+            LATEST_CKPT="$ckpt"
+        fi
+    done
+    if [ -n "$LATEST_CKPT" ]; then
+        RESUME_FROM="$LATEST_CKPT"
         echo "INFO: Auto-resuming from $RESUME_FROM"
     else
-        echo "INFO: No checkpoint at $AUTO_CKPT — starting fresh"
+        echo "INFO: No previous checkpoint matching ${STABLE_KEY}-job*/last.ckpt — starting fresh"
     fi
 else
     echo "INFO: Using explicit RESUME_FROM=$RESUME_FROM"
@@ -117,9 +148,11 @@ echo "REPO_DIR       : $REPO_DIR"
 echo "CONDA_ENV      : $CONDA_ENV"
 echo "HALO8_SOURCE   : $HALO8_SOURCE"
 echo "HALO8_DATADIR  : $HALO8_DATADIR"
+echo "EXPERIMENT_ID  : $EXPERIMENT_ID"
+echo "JOB_TAG        : $JOB_TAG"
+echo "STABLE_KEY     : $STABLE_KEY"
 echo "RUN_NAME       : $RUN_NAME"
 echo "PROJECT_NAME   : $PROJECT_NAME"
-echo "EXPERIMENT_ID  : $EXPERIMENT_ID"
 echo "EARLY_STOP     : patience=$EARLY_STOP_PATIENCE min_delta=$EARLY_STOP_MIN_DELTA"
 echo "RESUME_FROM    : ${RESUME_FROM:-<none>}"
 echo "=========================================="
