@@ -87,6 +87,14 @@ mkdir -p "$REPO_DIR/logs" "$REPO_DIR/checkpoint" "$REPO_DIR/results" \
     || { echo "ERROR: Cannot create output directories under $REPO_DIR"; exit 1; }
 cd "$REPO_DIR" || { echo "ERROR: Cannot cd to REPO_DIR=$REPO_DIR"; exit 1; }
 
+# Strip stale __pycache__ before any Python invocation. Switching between
+# cb-* branches leaves .pyc files compiled from a different branch's source
+# (e.g. cb-D's egnn_dynamics with learn_importance) and Python's
+# mtime-based invalidation does not always notice on this filesystem,
+# producing failures like:
+#   TypeError: EGNNDynamics.__init__() got an unexpected keyword argument 'learn_importance'
+find "$REPO_DIR" -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+
 # Activate conda env
 if conda_base=$(conda info --base 2>/dev/null); then
     source "$conda_base/etc/profile.d/conda.sh"
