@@ -244,6 +244,129 @@ def make_pred(representations, device, opt):
 
     return fragments_nodes, (x0_other[:, -1].unsqueeze(1), r_pos, ts_pos, p_pos)
 
+def predict_ts_ensemble(
+    model,
+    representations,
+    conditions,
+    pos_R=None,
+    pos_P=None,
+    atomic_numbers=None,
+    K: int = 5,
+    sigma_base: float = 0.1,
+    nfe: int = 10,
+    seed=None,
+    selection_method: str = "rmsd_consensus",
+    ot_ode: bool = True,
+    apply_clash_check: bool = True,
+    core_weight_clip: float = 0.9,
+):
+    """Idea 2-E (v2): stochastic-ensemble TS prediction pipeline.
+
+    1. Build base x0 (IDPP via Idea 2-A if present, else (R+P)/2).
+    2. Compute per-atom weights (Idea 1-A if present, else displacement-magnitude
+       proxy from `compute_atom_weights_or_fallback`).
+    3. Generate K perturbed initial structures (k=0 is always the un-perturbed
+       base, so the deterministic anchor is part of the ensemble).
+    4. Drive `model.ddpm.ode_sampling_ensemble` to get K predicted TS.
+    5. Select the best with `select_best_from_ensemble` (medoid by default).
+
+    Args:
+        model: a SBModule (already loaded + eval-mode + on the right device).
+        representations: standard 3-fragment (R, TS-init, P) representation
+            dicts as produced by `parse_rxn_xyzs` / dataset collate_fn.
+            `representations[1]["pos"]` will be virtually replaced by each
+            ensemble candidate inside `ode_sampling_ensemble`.
+        conditions: standard ReactOT conditions tensor / dict.
+        pos_R, pos_P, atomic_numbers: per-atom numpy arrays. Optional --
+            defaulted from `representations` when omitted. Required to
+            compute the perturbation weights.
+        K, sigma_base, seed, apply_clash_check, core_weight_clip: see
+            `generate_stochastic_x0_ensemble`.
+        nfe, ot_ode: pass-through to the underlying ODE sampler.
+        selection_method: 'rmsd_consensus' | 'midpoint_distance'.
+
+    Returns:
+        dict with keys:
+          best_ts        : numpy array (N, 3) -- selected TS structure
+          best_idx       : int               -- index into ts_ensemble
+          ts_ensemble    : numpy (K, N, 3)   -- all K predicted TS
+          x0_ensemble    : numpy (K, N, 3)   -- the K initial structures
+          diversity      : dict              -- pairwise-RMSD stats
+    """
+    import torch as _torch
+
+    from reactot.utils.initial_guess import (
+        compute_atom_weights_or_fallback,
+        compute_x0_base_or_midpoint,
+        ensemble_diversity_stats,
+        generate_stochastic_x0_ensemble,
+        select_best_from_ensemble,
+    )
+
+    # Pull pos_R / pos_P / atomic_numbers from representations when not given.
+    # This keeps the call site terse for the common single-reaction case.
+    repre_R, _repre_T, repre_P = representations
+    device = repre_R["pos"].device
+    if pos_R is None:
+        pos_R = repre_R["pos"].detach().cpu().numpy()
+    if pos_P is None:
+        pos_P = repre_P["pos"].detach().cpu().numpy()
+    if atomic_numbers is None:
+        atomic_numbers = repre_R["charge"].detach().cpu().numpy().reshape(-1)
+
+    pos_R = np.asarray(pos_R, dtype=np.float32)
+    pos_P = np.asarray(pos_P, dtype=np.float32)
+    atomic_numbers = np.asarray(atomic_numbers).astype(np.int64)
+
+    # 1. Base x0 (IDPP from Idea 2-A if available, else midpoint).
+    x0_base = compute_x0_base_or_midpoint(pos_R, pos_P, atomic_numbers)
+
+    # 2. Per-atom weights (Idea 1-A if available, else displacement proxy).
+    weights = compute_atom_weights_or_fallback(pos_R, pos_P, atomic_numbers)
+
+    # 3. K perturbed candidates. k=0 is the un-perturbed base.
+    x0_ensemble = generate_stochastic_x0_ensemble(
+        x0_base,
+        atomic_numbers,
+        weights,
+        K=K,
+        sigma_base=sigma_base,
+        seed=seed,
+        apply_clash_check=apply_clash_check,
+        core_weight_clip=core_weight_clip,
+    )
+
+    # 4. Run the K-fold reverse ODE/DDPM sampling.
+    x1_ensemble_t = [
+        _torch.tensor(x0_ensemble[k], dtype=_torch.float32, device=device)
+        for k in range(K)
+    ]
+    ts_list = model.ddpm.ode_sampling_ensemble(
+        x1_ensemble=x1_ensemble_t,
+        representations=representations,
+        conditions=conditions,
+        nfe=nfe,
+        ot_ode=ot_ode,
+    )
+    ts_ensemble = np.stack(
+        [t.numpy().astype(np.float32) for t in ts_list], axis=0
+    )  # (K, N, 3)
+
+    # 5. Select the best via Kabsch-aware RMSD consensus (or midpoint distance).
+    best_ts, best_idx = select_best_from_ensemble(
+        ts_ensemble, pos_R, pos_P, method=selection_method
+    )
+    diversity = ensemble_diversity_stats(ts_ensemble)
+
+    return {
+        "best_ts": best_ts,
+        "best_idx": best_idx,
+        "ts_ensemble": ts_ensemble,
+        "x0_ensemble": x0_ensemble,
+        "diversity": diversity,
+    }
+
+
 def pred_ts(rxyz, pxyz, opt, output_path):
     """
     Apply React-OT to provide a TS structure based on input R and P

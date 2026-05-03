@@ -453,7 +453,18 @@ class EnSB(nn.Module):
 
     @torch.no_grad()
     def sample(self, x1, representations, conditions,
-               clip_denoise=True, nfe=None, log_count=10, verbose=False, ot_ode=True):
+               clip_denoise=True, nfe=None, log_count=10, verbose=False, ot_ode=True,
+               x1_override=None):
+        """Reverse-time sampler. ``x1`` is the starting point of the integration
+        (the initial guess, e.g. the (R+P)/2 midpoint).
+
+        ``x1_override``: optional Tensor of shape (n_atoms_total, 3). When given,
+        replaces the x1 computed by ``sample_batch`` with the supplied tensor
+        (after CoG removal) so callers can drive ``sample()`` from a perturbed
+        starting structure -- the entry point for the Idea 2-E stochastic
+        ensemble. ``x1`` (the positional arg) is still required for backwards
+        compatibility but is shadowed when override is set.
+        """
 
         # create discrete time steps that split [0, INTERVAL] into NFE sub-intervals.
         # e.g., if NFE=2 & INTERVAL=1000, then STEPS=[0, 500, 999] and 2 network
@@ -476,6 +487,15 @@ class EnSB(nn.Module):
 
         x0, x1, cond, x0_size, x0_other = self.sample_batch(
             representations, conditions, return_timesteps=False, training=True)
+
+        # Idea 2-E: stochastic ensemble entry point. When the caller supplies a
+        # perturbed initial structure, replace the (R+P)/2 (or whichever
+        # mapping_initial-derived) x1 with it. The override is mean-removed
+        # using the same ts_mask sample_batch already used so the per-fragment
+        # CoG invariant is preserved.
+        if x1_override is not None:
+            x1_override = x1_override.to(x1.device).to(x1.dtype)
+            x1 = utils.remove_mean_batch(x1_override, cond["ts_mask"])
 
         xh_t = [
             torch.cat(
@@ -548,6 +568,57 @@ class EnSB(nn.Module):
         torch.cuda.empty_cache()
 
         return xs, pred_x0
+
+    @torch.no_grad()
+    def ode_sampling_ensemble(
+        self,
+        x1_ensemble,
+        representations,
+        conditions,
+        clip_denoise: bool = True,
+        nfe: Optional[int] = None,
+        log_count: int = 10,
+        verbose: bool = False,
+        ot_ode: bool = True,
+    ):
+        """Run the reverse-time sampler K times, once per perturbed x1.
+
+        Idea 2-E (Stochastic ensemble). For each of K candidate initial guesses
+        in ``x1_ensemble``, drives ``self.sample`` with that x1 via
+        ``x1_override`` and collects the predicted TS at t=0.
+
+        Args:
+            x1_ensemble: iterable of K tensors with shape (n_atoms_total, 3).
+                In EnSB convention, x1 is the *starting* point of the reverse
+                ODE -- equivalent to the markdown's "x0_ensemble".
+            representations: standard 3-fragment representation dicts.
+            conditions: standard ReactOT conditions tensor / dict.
+            nfe, ot_ode, clip_denoise, log_count, verbose: pass-through to
+                ``sample()``.
+
+        Returns:
+            ts_ensemble: list of K tensors with shape (n_atoms_total, 3),
+                detached and on CPU. Caller is responsible for re-grouping
+                them into per-reaction (K, n_atoms, 3) blocks.
+        """
+        ts_ensemble = []
+        for x1_k in x1_ensemble:
+            xs, _ = self.sample(
+                x1_k,
+                representations,
+                conditions,
+                clip_denoise=clip_denoise,
+                nfe=nfe,
+                log_count=log_count,
+                verbose=verbose,
+                ot_ode=ot_ode,
+                x1_override=x1_k,
+            )
+            # xs has shape (n_atoms_total, n_log_steps, 3); xs[:, 0, ...] is
+            # the t=0 sample (the predicted TS).
+            ts_pred = xs[:, 0, ...].detach().cpu()
+            ts_ensemble.append(ts_pred)
+        return ts_ensemble
 
     ###################Exponential Integrator
     def EI_ODE(self, t, x_n, x0, idx, r, ot_ode=False):
