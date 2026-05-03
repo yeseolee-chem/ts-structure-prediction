@@ -35,9 +35,12 @@
 #   Override OUTPUT_DIR=/some/other/path to centralize elsewhere; the
 #   directory is created automatically. If a worktree already has
 #   logs/, checkpoint/, or results/ as a non-empty real directory
-#   (legacy output from before this change), the script warns and
-#   leaves it alone — that branch's output keeps accumulating
-#   in-worktree until the user moves/deletes those directories.
+#   (typically from earlier runs when the slurm body's mkdir + SLURM's
+#   own mix_<jobid>.{out,err} capture left behind real dirs), its
+#   contents are moved into the central tree and the dir is replaced
+#   with a symlink. Migration is per-entry: any entry that already
+#   exists in the central tree (extremely unlikely thanks to RUN_NAME's
+#   uniqueness) is left in place with a WARN.
 #
 # Why this exists — the simpler inline loop that this replaces:
 #     for B in $BRANCHES; do
@@ -176,8 +179,13 @@ ensure_worktree() {
 # repo), no symlinks are created — the dirs we mkdir'd at script start
 # already ARE the worktree's output dirs.
 #
-# When $WT/<name> already exists as a non-empty real directory, we leave
-# it alone and warn — clobbering would lose prior runs' artifacts.
+# When $WT/<name> exists as a non-empty real directory (typically left
+# behind by an earlier run when the slurm script body did a `mkdir -p`
+# and SLURM dropped its mix_<jobid>.{out,err} there), its contents are
+# moved into the central tree and the dir is replaced with a symlink.
+# Because RUN_NAME embeds branch + slurm-job-id + rand8, collisions in
+# $OUTPUT_DIR are not expected; if one happens we leave just the
+# colliding entry behind and warn for that one.
 ensure_output_layout() {
     local wt="$1"
     local name target link wt_real out_real
@@ -193,6 +201,11 @@ ensure_output_layout() {
         target="$OUTPUT_DIR/$name"
         link="$wt/$name"
 
+        # Defensive: if $target doesn't exist (manual deletion, race),
+        # the `mv $item $target/` below would rename rather than move
+        # into. Re-creating here is cheap and idempotent.
+        mkdir -p "$target"
+
         if [ -L "$link" ]; then
             # Already a symlink — repoint it (handles OUTPUT_DIR changes).
             ln -sfn "$target" "$link"
@@ -202,15 +215,46 @@ ensure_output_layout() {
             ln -sfn "$target" "$link"
             continue
         fi
-        # Path exists as a real file/dir.
-        if [ -d "$link" ] && [ -z "$(ls -A "$link" 2>/dev/null)" ]; then
-            # Empty real directory — safe to replace with a symlink.
-            rmdir "$link" && ln -sfn "$target" "$link"
+        if ! [ -d "$link" ]; then
+            # Some non-directory file is sitting where we want a symlink.
+            # Don't touch it; just complain.
+            echo "WARN: $link exists and is not a directory; skipping" >&2
             continue
         fi
-        echo "WARN: $link is a non-empty real path; this branch's output" >&2
-        echo "      will accumulate INSIDE the worktree instead of under" >&2
-        echo "      $OUTPUT_DIR. Move/delete $link and re-run to centralize." >&2
+
+        # Real directory. Migrate every entry (including hidden) into
+        # $target and then replace $link with a symlink. mv is atomic
+        # and preserves open file descriptors, so it's safe to run even
+        # if a SLURM job is currently writing into one of these files —
+        # the kernel keeps the FD valid through the rename.
+        local moved=0 skipped=0 item base
+        while IFS= read -r -d '' item; do
+            base=$(basename "$item")
+            if [ -e "$target/$base" ]; then
+                echo "WARN: $target/$base already exists; leaving $item in place" >&2
+                skipped=$((skipped+1))
+                continue
+            fi
+            if mv "$item" "$target/" 2>/dev/null; then
+                moved=$((moved+1))
+            else
+                echo "WARN: failed to move $item into $target/" >&2
+                skipped=$((skipped+1))
+            fi
+        done < <(find "$link" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+
+        if [ "$moved" -gt 0 ]; then
+            echo "INFO: migrated $moved entry/entries from $link into $target" >&2
+        fi
+
+        if [ -z "$(ls -A "$link" 2>/dev/null)" ]; then
+            # Fully drained — promote to symlink.
+            rmdir "$link" && ln -sfn "$target" "$link"
+        else
+            echo "WARN: $skipped entry/entries remain in $link; this branch's" >&2
+            echo "      NEW output will write INSIDE the worktree, NOT into" >&2
+            echo "      $target. Resolve the conflict and re-run to centralize." >&2
+        fi
     done
 }
 
