@@ -4,17 +4,40 @@
 # ---------------------------------------------------------------------------
 # Each experimental branch (cb-*, rp-*, reactot-halo8) implements a different
 # idea. To run them in parallel without cross-branch source contamination
-# (see reactot/trainer/train_rpsb_ts1x.py::_git_branch_tag), every job needs
-# its own checked-out working directory — a `git worktree`.
+# (see reactot/trainer/train_rpsb_ts1x.py::_git_branch_tag, which refuses to
+# train if EXPERIMENT_ID disagrees with the live `git rev-parse HEAD` of the
+# job's cwd), every job MUST run inside its own checked-out working
+# directory — a `git worktree`.
 #
-# Default behavior (matches the documented manual submission flow):
+# Default behavior:
 #   1. For each branch in BRANCHES: locate an existing worktree (anywhere)
 #      OR create a new one at "../ts-prediction-<B>"; pull origin/<B>;
-#      pre-create logs/, checkpoint/, results/; submit run_${WRAPPER}_slurm.sh
+#      set up output layout (see below); submit run_${WRAPPER}_slurm.sh
 #      with DATA_LIMIT=$DATA_LIMIT EXPERIMENT_ID=<B>.
 #   2. Then, for each branch in EXTRA_T1X_BRANCHES (default
 #      "reactot-halo8"), additionally submit run_t1x_slurm.sh — this is
 #      the T1x-only baseline that pairs with the augmented mix dataset.
+#
+# Output centralization (the reason every job's logs/checkpoint/results
+# show up in the main repo, not scattered across 16 worktrees):
+#   The trainer's cwd MUST stay in its own worktree (so `git rev-parse`
+#   matches EXPERIMENT_ID; otherwise _git_branch_tag raises
+#   "Cross-branch contamination detected"). But the user wants all
+#   output visible in one place. Solution: per-worktree logs/,
+#   checkpoint/, results/ are symlinked into $OUTPUT_DIR (default the
+#   main repo). The job's cwd stays in its worktree, but all writes —
+#   SLURM's --output=logs/<wrapper>_%j.out, the trainer's
+#   checkpoint/<project>/<run-name>/ tree, plot_metrics.py's results/,
+#   and PL CSVLogger's logs/<run-name>/ — funnel through the symlinks
+#   into one shared tree. RUN_NAME embeds branch+job-id+rand so no two
+#   jobs collide on a directory or filename.
+#
+#   Override OUTPUT_DIR=/some/other/path to centralize elsewhere; the
+#   directory is created automatically. If a worktree already has
+#   logs/, checkpoint/, or results/ as a non-empty real directory
+#   (legacy output from before this change), the script warns and
+#   leaves it alone — that branch's output keeps accumulating
+#   in-worktree until the user moves/deletes those directories.
 #
 # Why this exists — the simpler inline loop that this replaces:
 #     for B in $BRANCHES; do
@@ -22,7 +45,7 @@
 #       [ -d "$WT" ] || git worktree add "$WT" "$B"
 #       ( cd "$WT" && sbatch run_mix_slurm.sh )
 #     done
-# fails for two distinct reasons that this wrapper handles:
+# fails for three distinct reasons that this wrapper handles:
 #
 #   - When <B> is already checked out somewhere (most commonly the main
 #     repo itself, e.g. /gpfs/.../ts-structure-prediction holding cb-C),
@@ -36,13 +59,21 @@
 #     resolved against cwd at submit time but writes the file at
 #     job-start time. If logs/ doesn't exist when the job starts, the
 #     stdout/stderr capture silently fails — and the `mkdir -p` inside
-#     the slurm script body runs too late to fix it. We pre-create
-#     logs/, checkpoint/, results/ in the worktree before sbatch.
+#     the slurm script body runs too late to fix it. We pre-create the
+#     output layout in the worktree before sbatch.
+#
+#   - With per-worktree logs/checkpoint/results, output ends up scattered
+#     across 16 directories, so only the branch checked out in the main
+#     repo (the one the user `cd`s into) appears to be "working" in any
+#     casual file-explorer view. Symlinking funnels everything into one
+#     shared location while preserving the per-worktree cwd that the
+#     contamination check requires.
 #
 # Usage:
 #   bash submit_all_branches.sh                                 # mix (all) + t1x (halo8)
 #   WRAPPER=t1x bash submit_all_branches.sh                     # t1x for the main pass
 #   EXTRA_T1X_BRANCHES="" bash submit_all_branches.sh           # disable the extra pass
+#   OUTPUT_DIR=/scratch/$USER/reactot-out bash submit_all_branches.sh
 #   BRANCHES="cb-A cb-B" bash submit_all_branches.sh            # subset
 #   DATA_LIMIT=300 bash submit_all_branches.sh                  # smaller subset
 #   DRY_RUN=1 bash submit_all_branches.sh                       # show plan only
@@ -66,10 +97,16 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)
 PARENT_DIR=$(dirname "$REPO_ROOT")
 
+# All worktrees' logs/checkpoint/results funnel here via symlinks. Default
+# to the main repo so output appears in the directory the user normally
+# `cd`s into.
+OUTPUT_DIR=${OUTPUT_DIR:-"$REPO_ROOT"}
+
 echo "==========================================="
 echo "submit_all_branches.sh"
 echo "REPO_ROOT          : $REPO_ROOT"
 echo "PARENT_DIR         : $PARENT_DIR"
+echo "OUTPUT_DIR         : $OUTPUT_DIR"
 echo "WRAPPER            : $WRAPPER (run_${WRAPPER}_slurm.sh)"
 echo "DATA_LIMIT         : $DATA_LIMIT"
 echo "DRY_RUN            : $DRY_RUN"
@@ -82,6 +119,9 @@ echo "==========================================="
 if [ "$DRY_RUN" = "0" ]; then
     git -C "$REPO_ROOT" fetch --all --prune || echo "WARN: fetch failed; continuing"
 fi
+
+# Make sure the central output tree exists before any worktree links into it.
+mkdir -p "$OUTPUT_DIR/logs" "$OUTPUT_DIR/checkpoint" "$OUTPUT_DIR/results"
 
 submit_count=0
 fail_count=0
@@ -128,6 +168,52 @@ ensure_worktree() {
     return 0
 }
 
+# ---- Set up the output layout for one worktree ----------------------------
+# Makes $WT/logs, $WT/checkpoint, $WT/results resolve to the corresponding
+# subdirs of $OUTPUT_DIR. Idempotent across re-runs.
+#
+# When $WT IS $OUTPUT_DIR (i.e. the branch is checked out in the main
+# repo), no symlinks are created — the dirs we mkdir'd at script start
+# already ARE the worktree's output dirs.
+#
+# When $WT/<name> already exists as a non-empty real directory, we leave
+# it alone and warn — clobbering would lose prior runs' artifacts.
+ensure_output_layout() {
+    local wt="$1"
+    local name target link wt_real out_real
+
+    wt_real=$(cd "$wt" 2>/dev/null && pwd -P)
+    out_real=$(cd "$OUTPUT_DIR" 2>/dev/null && pwd -P)
+    if [ -n "$wt_real" ] && [ "$wt_real" = "$out_real" ]; then
+        # Worktree IS the output dir; nothing to symlink.
+        return 0
+    fi
+
+    for name in logs checkpoint results; do
+        target="$OUTPUT_DIR/$name"
+        link="$wt/$name"
+
+        if [ -L "$link" ]; then
+            # Already a symlink — repoint it (handles OUTPUT_DIR changes).
+            ln -sfn "$target" "$link"
+            continue
+        fi
+        if [ ! -e "$link" ]; then
+            ln -sfn "$target" "$link"
+            continue
+        fi
+        # Path exists as a real file/dir.
+        if [ -d "$link" ] && [ -z "$(ls -A "$link" 2>/dev/null)" ]; then
+            # Empty real directory — safe to replace with a symlink.
+            rmdir "$link" && ln -sfn "$target" "$link"
+            continue
+        fi
+        echo "WARN: $link is a non-empty real path; this branch's output" >&2
+        echo "      will accumulate INSIDE the worktree instead of under" >&2
+        echo "      $OUTPUT_DIR. Move/delete $link and re-run to centralize." >&2
+    done
+}
+
 # ---- Submit one slurm wrapper for one branch ------------------------------
 # Mutates submit_count / fail_count / failed_jobs.
 submit_one() {
@@ -148,10 +234,13 @@ submit_one() {
         fi
     fi
 
-    # Pre-create output directories — see header for why this MUST happen
-    # before sbatch. The slurm script body also creates them, but that's
-    # too late: SLURM has already opened logs/<wrapper>_%j.out by then.
-    mkdir -p "$WT/logs" "$WT/checkpoint" "$WT/results"
+    # Set up output layout BEFORE sbatch. SLURM resolves --output=
+    # against cwd at submit time but opens the file at job-start time;
+    # if logs/ doesn't exist (or is a broken symlink) by then, stdout/
+    # stderr capture silently fails. After this call, $WT/logs etc.
+    # either are real dirs (when $WT == $OUTPUT_DIR) or are symlinks to
+    # the corresponding $OUTPUT_DIR subdirs.
+    ensure_output_layout "$WT"
 
     if [ ! -f "$WT/$SCRIPT" ]; then
         echo "ERROR: $SCRIPT not found in $WT — skipping"
@@ -191,6 +280,7 @@ fi
 echo ""
 echo "==========================================="
 echo "Summary: submitted=$submit_count  failed=$fail_count"
+echo "Output  : $OUTPUT_DIR/{logs,checkpoint,results}"
 if [ -n "$failed_jobs" ]; then
     echo "Failed jobs:$failed_jobs"
 fi
