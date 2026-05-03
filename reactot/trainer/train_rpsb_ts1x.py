@@ -10,24 +10,65 @@ import torch
 
 
 def _git_branch_tag() -> str:
-    """Best-effort git branch identifier for run_name disambiguation.
+    """Branch identifier for run_name disambiguation.
 
-    Falls back to "unknown-branch" when git/repo is not available. The
-    point is to ensure two different experimental branches (reactot-halo8,
-    cb-A, cb-D, ...) cannot accidentally share a checkpoint directory and
-    overwrite each other's last.ckpt — which previously caused the
-    bit-identical val_rmsd numbers across runs.
+    Prefers the EXPERIMENT_ID env var (set by the SLURM script before
+    Python ever starts) over a live `git rev-parse`. The live read is
+    UNRELIABLE when multiple parallel jobs share one git working
+    directory and the user runs `git checkout` between submissions:
+    every running job's `git rev-parse` reflects whatever branch is
+    checked out RIGHT NOW, not the branch that was checked out when
+    the job was queued. Two symptoms used to follow:
+
+      1. Checkpoint dirs ended up double-tagged like
+         `mix-Mix-dl500-cb-A-job610942-…-cb-B` because the slurm
+         script captured "cb-A" but the trainer's later `git
+         rev-parse` returned "cb-B".
+      2. Even when the run-name looked right, the .py code being
+         imported was whichever branch was checked out at trainer
+         start, so "different" experiments produced bit-identical
+         val_rmsd curves.
+
+    When BOTH the env var and the live git branch are present and
+    they DISAGREE we raise loudly. The mismatch means the working
+    directory was switched between submission and execution; the
+    Python module import path resolves to the LIVE branch's source,
+    not the env's, so any results this run produces are invalid.
+    Fix: give each parallel experiment its own checkout via
+    `git worktree add ../<dir> <branch>` and submit each job from
+    its own worktree.
     """
+    env_tag = os.environ.get("EXPERIMENT_ID", "").strip()
+    git_tag = ""
     try:
-        out = subprocess.check_output(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        return out.replace("/", "-") or "unknown-branch"
+        git_tag = (
+            subprocess.check_output(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=os.path.dirname(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                ),
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            .strip()
+            .replace("/", "-")
+        )
     except Exception:
-        return "unknown-branch"
+        pass
+
+    if env_tag and git_tag and env_tag != git_tag:
+        raise RuntimeError(
+            "Cross-branch contamination detected — refusing to train.\n"
+            f"  EXPERIMENT_ID = {env_tag!r}  (set by SLURM at job submit)\n"
+            f"  live git HEAD = {git_tag!r}  (working dir at trainer start)\n"
+            f"The Python source being imported is from {git_tag!r}, NOT "
+            f"{env_tag!r}, so this run would produce results for the wrong "
+            "experiment.\n"
+            "Fix: give each parallel job its own checkout, e.g.\n"
+            f"    git worktree add ../ts-prediction-{env_tag} {env_tag}\n"
+            f"    cd ../ts-prediction-{env_tag} && sbatch run_mix_slurm.sh"
+        )
+    return env_tag or git_tag or "unknown-branch"
 
 from reactot.trainer.pl_trainer import SBModule
 from pytorch_lightning import Trainer, seed_everything
