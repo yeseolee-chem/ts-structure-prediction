@@ -48,6 +48,8 @@ class EnSB(nn.Module):
         sigma: float = 0.0,
         ts_guess: bool = False,
         idx: int = 1,
+        x0_method: str = "midpoint",
+        learned_x0_checkpoint: Optional[str] = None,
     ):
         super().__init__()
         assert loss_type in {"vlb", "l2"}
@@ -72,6 +74,21 @@ class EnSB(nn.Module):
         self.sigma = sigma
         self.ts_guess = ts_guess
         self.idx = idx
+        # x_0 generator (Idea 2-F).
+        # x0_method ∈ {"midpoint", "idpp", "linear", "learned"}.
+        # Only consulted when mapping_initial == 'RP'; preserves the legacy
+        # midpoint behaviour for any other config.
+        if x0_method not in {"midpoint", "idpp", "linear", "learned"}:
+            raise ValueError(
+                f"x0_method={x0_method!r} not in "
+                "{'midpoint','idpp','linear','learned'}"
+            )
+        if x0_method == "learned" and not learned_x0_checkpoint:
+            raise ValueError(
+                "x0_method='learned' requires learned_x0_checkpoint"
+            )
+        self.x0_method = x0_method
+        self.learned_x0_checkpoint = learned_x0_checkpoint
         
         if idx == 1:
             assert mapping.split(">")[-1] == "TS"
@@ -125,7 +142,19 @@ class EnSB(nn.Module):
                 #     x1 = r_pos * factor + p_pos * (1 - factor)
                 # else:
                 #     x1 = (r_pos+p_pos) / 2
-                x1 = (r_pos+p_pos) / 2
+                if self.x0_method == "midpoint":
+                    x1 = (r_pos + p_pos) / 2
+                else:
+                    # Routes to idpp / linear / learned. The x0_other tensor
+                    # carries Z in its last column (one_hot is preceded by it
+                    # in the standard ordering — see compute_label callsites
+                    # for the same convention).
+                    x1 = utils.idpp_guess(
+                        r_pos, p_pos, t_size, t_other,
+                        n_images=3,
+                        interpolate=self.x0_method,
+                        learned_x0_checkpoint=self.learned_x0_checkpoint,
+                    )
             elif self.mapping_initial == 'GUESS' and self.ts_guess:
                 x1 = conditions["ts_guess"].float().to(r_pos.device)
             elif self.mapping_initial == 'R':

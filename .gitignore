@@ -33,6 +33,8 @@ env/
 
 # Run artifacts (these can grow huge — keep them local)
 checkpoint/
+checkpoints/
+data/
 logs/
 results/
 wandb/

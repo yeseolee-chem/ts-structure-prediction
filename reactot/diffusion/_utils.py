@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import math
 import torch
@@ -85,7 +85,62 @@ def space_indices(num_steps, count):
     return taken_steps
 
 
-def idpp_guess(r_pos, p_pos, x0_size, x0_other, n_images=3, interpolate="idpp"):
+def idpp_guess(r_pos, p_pos, x0_size, x0_other,
+               n_images=3,
+               interpolate="idpp",
+               use_clash_penalty=True,
+               learned_x0_checkpoint: Optional[str] = None):
+    """Initial-guess generator for x_0 in OT-FM.
+
+    Parameters
+    ----------
+    r_pos, p_pos : Tensor
+        Per-atom positions for reactants / products (concatenated across batch).
+    x0_size : Tensor
+        Per-sample atom counts (used to split the concatenated tensors).
+    x0_other : Tensor
+        Per-atom feature block whose last column is atomic number Z.
+    n_images : int
+        Number of NEB images (used for the IDPP/linear paths).
+    interpolate : {"idpp", "linear", "learned"}
+        - "idpp"    : IDPP-interpolated NEB midpoint (legacy default)
+        - "linear"  : straight-line NEB midpoint
+        - "learned" : x_0 from a trained ``X0PredictorEGNN`` checkpoint
+                      (Idea 2-F). Requires ``learned_x0_checkpoint``.
+    use_clash_penalty : bool
+        Reserved for future clash-aware variants; currently a no-op.
+    learned_x0_checkpoint : Optional[str]
+        Path to a trained x_0 predictor checkpoint. Required when
+        ``interpolate == "learned"``.
+    """
+    if interpolate == "learned":
+        if learned_x0_checkpoint is None:
+            raise ValueError(
+                "interpolate='learned'는 learned_x0_checkpoint 경로가 필요합니다"
+            )
+        from reactot.utils.initial_guess import compute_learned_x0
+
+        split_indices = torch.cumsum(x0_size, dim=0).cpu().tolist()[:-1]
+        _r_pos = torch.tensor_split(r_pos, split_indices)
+        _p_pos = torch.tensor_split(p_pos, split_indices)
+        z_split = torch.tensor_split(x0_other[:, -1], split_indices)
+        z_list = [_z.long().cpu().numpy() for _z in z_split]
+
+        device_str = "cuda" if (
+            isinstance(x0_size, torch.Tensor) and x0_size.is_cuda
+        ) else "cpu"
+
+        ts_pos = []
+        for x_r, x_p, atom_number in zip(_r_pos, _p_pos, z_list):
+            x0 = compute_learned_x0(
+                x_r.cpu().numpy(), x_p.cpu().numpy(), atom_number,
+                model_checkpoint=learned_x0_checkpoint,
+                device=device_str,
+            )
+            ts_pos.append(torch.tensor(x0, dtype=torch.float32))
+
+        return torch.concat(ts_pos).to(x0_size.device)
+
     _r_pos = torch.tensor_split(
         r_pos,
         torch.cumsum(x0_size, dim=0).to("cpu")[:-1]
@@ -126,7 +181,7 @@ def idpp_guess(r_pos, p_pos, x0_size, x0_other, n_images=3, interpolate="idpp"):
         elif interpolate == "linear":
             neb.interpolate('linear')
         else:
-            raise ValueError("interpolate can only be idpp or linear")
+            raise ValueError("interpolate can only be idpp, linear, or learned")
         x_ts = torch.tensor(
             neb.images[n_images // 2].arrays["positions"],
             dtype=torch.float32,

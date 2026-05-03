@@ -299,6 +299,18 @@ def main(argv=None):
     sigma: float = 0.0
     ts_guess = None
 
+    # x_0 method (Idea 2-F: learned x_0 predictor).
+    # x0_method ∈ {"midpoint", "idpp", "linear", "learned"}.
+    # When "learned", learned_x0_checkpoint must point to a trained
+    # X0PredictorEGNN .pt file (see scripts/train_x0_predictor.py).
+    x0_config = {
+        'x0_method': os.environ.get('X0_METHOD', 'midpoint'),
+        'learned_x0_checkpoint': os.environ.get(
+            'LEARNED_X0_CHECKPOINT',
+            'checkpoints/x0_predictor/x0_pred_epoch100.pt',
+        ),
+    }
+
     # Use a stable RUN_NAME from env when provided so the checkpoint dir is
     # predictable across resubmissions. When a SLURM job hits its walltime
     # and is resubmitted, the new run lands in the same directory and can
@@ -362,8 +374,15 @@ def main(argv=None):
         inv_power=inv_power,
         sigma=sigma,
         ts_guess=ts_guess,
+        x0_method=x0_config['x0_method'],
+        learned_x0_checkpoint=(
+            x0_config['learned_x0_checkpoint']
+            if x0_config['x0_method'] == 'learned'
+            else None
+        ),
     )
     ddpm.ddpm.opt = opt
+    print(f"[reactot] x0_config = {x0_config}")
 
     config = cfgs["leftnet_config"].copy()
     config.update(cfgs["optimizer_config"])
