@@ -86,6 +86,35 @@ def space_indices(num_steps, count):
 
 
 def idpp_guess(r_pos, p_pos, x0_size, x0_other, n_images=3, interpolate="idpp"):
+    """
+    Initial-guess interpolator.
+
+    interpolate ∈ {"idpp", "linear", "xtb_refine"}
+    - "idpp"       : ASE-NEB IDPP interpolation (legacy, EMT-based)
+    - "linear"     : ASE-NEB linear interpolation (legacy)
+    - "xtb_refine" : Idea 2-D — IDPP → GFN2-xTB short refinement
+                     (see reactot.utils.initial_guess.compute_xtb_refined_x0_with_idpp)
+    """
+    if interpolate == "xtb_refine":
+        from reactot.utils.initial_guess import compute_xtb_refined_x0_with_idpp
+
+        split_indices = torch.cumsum(x0_size, dim=0).cpu().tolist()[:-1]
+        _r_pos = torch.tensor_split(r_pos, split_indices)
+        _p_pos = torch.tensor_split(p_pos, split_indices)
+        z_split = torch.tensor_split(x0_other[:, -1], split_indices)
+        z_list = [_z.long().cpu().numpy() for _z in z_split]
+
+        ts_pos = []
+        for x_r, x_p, atom_number in zip(_r_pos, _p_pos, z_list):
+            x0 = compute_xtb_refined_x0_with_idpp(
+                x_r.cpu().numpy(), x_p.cpu().numpy(), atom_number,
+                idpp_kwargs={'max_iter': 200, 'use_clash_penalty': True},
+                xtb_kwargs={'max_steps': 20, 'fmax': 0.5},
+            )
+            ts_pos.append(torch.tensor(x0, dtype=torch.float32))
+
+        return torch.concat(ts_pos).to(x0_size.device)
+
     _r_pos = torch.tensor_split(
         r_pos,
         torch.cumsum(x0_size, dim=0).to("cpu")[:-1]
@@ -126,7 +155,7 @@ def idpp_guess(r_pos, p_pos, x0_size, x0_other, n_images=3, interpolate="idpp"):
         elif interpolate == "linear":
             neb.interpolate('linear')
         else:
-            raise ValueError("interpolate can only be idpp or linear")
+            raise ValueError("interpolate can only be idpp, linear, or xtb_refine")
         x_ts = torch.tensor(
             neb.images[n_images // 2].arrays["positions"],
             dtype=torch.float32,

@@ -299,6 +299,23 @@ def main(argv=None):
     sigma: float = 0.0
     ts_guess = None
 
+    # Idea 2-D v2: GFN2-xTB semi-empirical refinement for x_0.
+    # Replaces (or post-processes) the (R+P)/2 midpoint with an xTB-relaxed
+    # initial guess. The "xtb_refine" path runs IDPP → GFN2-xTB (10–20 step
+    # short relax with core-bond constraints) so non-bonded clashes (vdW,
+    # electrostatics, lone-pair repulsion) are eased without disturbing the
+    # reaction coordinate. See reactot.utils.initial_guess.
+    x0_config = {
+        'x0_method': 'xtb_refine',   # "midpoint" | "idpp" | "xtb_refine"
+        'xtb_max_steps': 20,
+        'xtb_fmax': 0.5,             # eV/Å (ASE standard, loose)
+        'xtb_max_step_size': 0.05,   # Å
+        'xtb_method': 'GFN2-xTB',    # "GFN-FF" | "GFN1-xTB" | "GFN2-xTB"
+        'xtb_charge': 0,             # e.g. -1 for SN2 (Cl⁻ + CH₃Br)
+        'xtb_multiplicity': 1,       # closed-shell singlet
+        'xtb_use_idea1_core': False, # use Idea 1 core if available
+    }
+
     # Use a stable RUN_NAME from env when provided so the checkpoint dir is
     # predictable across resubmissions. When a SLURM job hits its walltime
     # and is resubmitted, the new run lands in the same directory and can
