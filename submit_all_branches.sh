@@ -171,6 +171,56 @@ ensure_worktree() {
     return 0
 }
 
+# ---- Recursive directory merge --------------------------------------------
+# Merge every entry from $src into $dst. Atomic mv when there's no name
+# collision; on collision, recurse if both sides are real directories
+# (the typical case is checkpoint/RPSB-FT-Schedule/ — the project name
+# is shared across all branches but the run-names inside are unique by
+# construction). Returns 0 if every entry was successfully relocated
+# (so $src is empty), 1 otherwise.
+recursive_merge() {
+    local src="$1" dst="$2"
+    local item base failed=0 moved=0
+
+    mkdir -p "$dst"
+
+    while IFS= read -r -d '' item; do
+        base=$(basename "$item")
+
+        if [ ! -e "$dst/$base" ]; then
+            if mv "$item" "$dst/" 2>/dev/null; then
+                moved=$((moved+1))
+                continue
+            fi
+            echo "WARN: failed to move $item into $dst/" >&2
+            failed=$((failed+1))
+            continue
+        fi
+
+        # Collision. Mergeable iff both sides are real directories
+        # (not symlinks, not files).
+        if [ -d "$item" ] && [ -d "$dst/$base" ] \
+                && ! [ -L "$item" ] && ! [ -L "$dst/$base" ]; then
+            if recursive_merge "$item" "$dst/$base"; then
+                rmdir "$item" 2>/dev/null
+                moved=$((moved+1))
+            else
+                failed=$((failed+1))
+            fi
+            continue
+        fi
+
+        # File-vs-file or file-vs-dir — can't auto-merge.
+        echo "WARN: $dst/$base already exists; leaving $item in place" >&2
+        failed=$((failed+1))
+    done < <(find "$src" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+
+    if [ "$moved" -gt 0 ]; then
+        echo "INFO: merged $moved entry/entries from $src into $dst" >&2
+    fi
+    [ "$failed" -eq 0 ]
+}
+
 # ---- Set up the output layout for one worktree ----------------------------
 # Makes $WT/logs, $WT/checkpoint, $WT/results resolve to the corresponding
 # subdirs of $OUTPUT_DIR. Idempotent across re-runs.
@@ -179,13 +229,15 @@ ensure_worktree() {
 # repo), no symlinks are created — the dirs we mkdir'd at script start
 # already ARE the worktree's output dirs.
 #
-# When $WT/<name> exists as a non-empty real directory (typically left
-# behind by an earlier run when the slurm script body did a `mkdir -p`
-# and SLURM dropped its mix_<jobid>.{out,err} there), its contents are
-# moved into the central tree and the dir is replaced with a symlink.
-# Because RUN_NAME embeds branch + slurm-job-id + rand8, collisions in
-# $OUTPUT_DIR are not expected; if one happens we leave just the
-# colliding entry behind and warn for that one.
+# When $WT/<name> exists as a real directory (typically left behind by
+# earlier runs that did mkdir + SLURM's mix_<jobid>.{out,err} capture),
+# its contents are recursively merged into $OUTPUT_DIR/<name> and the
+# dir is replaced with a symlink. mv is atomic and preserves open file
+# descriptors, so the merge is safe even while SLURM jobs are writing.
+# Recursion handles the checkpoint/<project-name>/ collision: every
+# branch's worktree has the same top-level project dir, but the
+# run-names inside are unique (RUN_NAME embeds branch + slurm-job-id +
+# rand8), so descending one level lets them merge cleanly.
 ensure_output_layout() {
     local wt="$1"
     local name target link wt_real out_real
@@ -193,7 +245,6 @@ ensure_output_layout() {
     wt_real=$(cd "$wt" 2>/dev/null && pwd -P)
     out_real=$(cd "$OUTPUT_DIR" 2>/dev/null && pwd -P)
     if [ -n "$wt_real" ] && [ "$wt_real" = "$out_real" ]; then
-        # Worktree IS the output dir; nothing to symlink.
         return 0
     fi
 
@@ -201,13 +252,11 @@ ensure_output_layout() {
         target="$OUTPUT_DIR/$name"
         link="$wt/$name"
 
-        # Defensive: if $target doesn't exist (manual deletion, race),
-        # the `mv $item $target/` below would rename rather than move
-        # into. Re-creating here is cheap and idempotent.
+        # Defensive: if $target doesn't exist, the `mv $item $target/`
+        # inside recursive_merge would rename rather than move into.
         mkdir -p "$target"
 
         if [ -L "$link" ]; then
-            # Already a symlink — repoint it (handles OUTPUT_DIR changes).
             ln -sfn "$target" "$link"
             continue
         fi
@@ -216,44 +265,16 @@ ensure_output_layout() {
             continue
         fi
         if ! [ -d "$link" ]; then
-            # Some non-directory file is sitting where we want a symlink.
-            # Don't touch it; just complain.
             echo "WARN: $link exists and is not a directory; skipping" >&2
             continue
         fi
 
-        # Real directory. Migrate every entry (including hidden) into
-        # $target and then replace $link with a symlink. mv is atomic
-        # and preserves open file descriptors, so it's safe to run even
-        # if a SLURM job is currently writing into one of these files —
-        # the kernel keeps the FD valid through the rename.
-        local moved=0 skipped=0 item base
-        while IFS= read -r -d '' item; do
-            base=$(basename "$item")
-            if [ -e "$target/$base" ]; then
-                echo "WARN: $target/$base already exists; leaving $item in place" >&2
-                skipped=$((skipped+1))
-                continue
-            fi
-            if mv "$item" "$target/" 2>/dev/null; then
-                moved=$((moved+1))
-            else
-                echo "WARN: failed to move $item into $target/" >&2
-                skipped=$((skipped+1))
-            fi
-        done < <(find "$link" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
-
-        if [ "$moved" -gt 0 ]; then
-            echo "INFO: migrated $moved entry/entries from $link into $target" >&2
-        fi
-
-        if [ -z "$(ls -A "$link" 2>/dev/null)" ]; then
-            # Fully drained — promote to symlink.
-            rmdir "$link" && ln -sfn "$target" "$link"
+        if recursive_merge "$link" "$target"; then
+            rmdir "$link" 2>/dev/null && ln -sfn "$target" "$link"
         else
-            echo "WARN: $skipped entry/entries remain in $link; this branch's" >&2
-            echo "      NEW output will write INSIDE the worktree, NOT into" >&2
-            echo "      $target. Resolve the conflict and re-run to centralize." >&2
+            echo "WARN: $link could not be fully merged into $target;" >&2
+            echo "      $link remains a real directory and this branch's" >&2
+            echo "      NEW output will write there instead of $target." >&2
         fi
     done
 }
