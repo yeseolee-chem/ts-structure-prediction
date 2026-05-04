@@ -299,6 +299,21 @@ def main(argv=None):
     sigma: float = 0.0
     ts_guess = None
 
+    # Combo [AD]: x_0 = IDPP + halogen-aware clash penalty + GFN2-xTB short
+    # refinement. xTB is invoked on-the-fly here; for production, pre-compute
+    # x0 with scripts/precompute_x0_xtb.py and load via ProcessedTS1x's
+    # x0_cache_dir. Set x0_method='midpoint' to recover the original
+    # (R+P)/2 behaviour exactly.
+    x0_config = {
+        'x0_method': 'a_d',  # "midpoint" | "idpp" | "linear" |
+                             # "idpp_clash" | "xtb_refine" | "a_d"
+        'idpp_max_iter': 200,
+        'idpp_tol': 0.01,
+        'idpp_lr': 0.01,
+        'clash_kappa': 10.0,
+        'use_clash_penalty': True,
+    }
+
     # Use a stable RUN_NAME from env when provided so the checkpoint dir is
     # predictable across resubmissions. When a SLURM job hits its walltime
     # and is resubmitted, the new run lands in the same directory and can
@@ -362,6 +377,7 @@ def main(argv=None):
         inv_power=inv_power,
         sigma=sigma,
         ts_guess=ts_guess,
+        **x0_config,
     )
     ddpm.ddpm.opt = opt
 
