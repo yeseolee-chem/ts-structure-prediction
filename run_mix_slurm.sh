@@ -154,7 +154,65 @@ if [ "${USE_WANDB:-0}" = "1" ]; then
     WANDB_FLAG=""
 fi
 
-python -u -m reactot.trainer.train_rpsb_ts1x --dataset Halo8 $WANDB_FLAG
+# ===========================================================================
+# Branch-specific activation flags
+# ---------------------------------------------------------------------------
+# Each cb-* branch implements a different atom-weighting scheme. Some
+# branches activate their scheme by default (cb-A, cb-AB, cb-C, cb-D,
+# cb-CD, cb-ABD), but others gate activation behind a CLI flag whose
+# default leaves the run looking like a different branch's result.
+#
+# Triaged 2026-05-04 from jobs 611956-611962 where:
+#   - cb-B without --element-aware-weights produced bit-identical val_loss
+#     to cb-A. cb-B trainer's --element-aware-weights default is False, so
+#     element_aware_weights stays off and the run reduces to cb-A's pure
+#     graph-distance code path.
+#   - cb-BCD without --prior-scheme/--learn-importance produced bit-
+#     identical val_loss to reactot-halo8. cb-BCD trainer skips its prior
+#     block entirely when args.prior_scheme is None, so no atom-weighting
+#     is applied at all.
+#   - cb-BC inherits the cb-AB --weighting-scheme default of "AB" — added
+#     defensively so the BC kernel is not silently bypassed even though
+#     cb-BC was not in the failing batch.
+#
+# The earlier rounds of fixes (purge stale .pyc, EXPERIMENT_ID guard,
+# unique RUN_NAME, per-worktree submission, output centralization via
+# symlinks) addressed plumbing — code import path, dir collisions, log
+# routing — but none of them activates the branch-specific weighting.
+# Without this case statement every "different" cb-* run can silently
+# collapse to whichever default its trainer ships with.
+#
+# When adding a new branch, append a case here. The catch-all ('*')
+# warns rather than failing so unrelated branches (claude/*, rp-*, main)
+# keep working without manual updates.
+# ===========================================================================
+EXTRA_FLAGS=""
+case "$EXPERIMENT_ID" in
+    reactot-halo8)
+        ;;
+    cb-A|cb-AB|cb-C|cb-D|cb-ABD|cb-CD)
+        ;;
+    cb-B)
+        EXTRA_FLAGS="--element-aware-weights"
+        ;;
+    cb-BC)
+        EXTRA_FLAGS="--weighting-scheme BC"
+        ;;
+    cb-BCD)
+        EXTRA_FLAGS="--prior-scheme BC --learn-importance"
+        ;;
+    rp-*|claude-*|main)
+        ;;
+    *)
+        echo "WARN: unknown EXPERIMENT_ID='$EXPERIMENT_ID' — no branch-specific flags applied."
+        ;;
+esac
+
+if [ -n "$EXTRA_FLAGS" ]; then
+    echo "Branch flags : $EXTRA_FLAGS"
+fi
+
+python -u -m reactot.trainer.train_rpsb_ts1x --dataset Halo8 $WANDB_FLAG $EXTRA_FLAGS
 EXIT_CODE=$?
 
 echo "=========================================="
