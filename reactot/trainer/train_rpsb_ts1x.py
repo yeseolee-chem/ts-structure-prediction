@@ -383,6 +383,26 @@ def main(argv=None):
     # on a checkpoint directory (was the root cause of identical val_rmsd
     # across reactot-halo8/cb-D Mix and reactot-halo8 T1x/cb-BCD).
     branch_tag = _git_branch_tag()
+
+    # Idea-1B activation guard. cb-B's distinguishing behaviour is
+    # element-aware FM-loss weighting (multiply graph-distance weight by
+    # per-element alpha_Z). The CLI default for --element-aware-weights
+    # is False, with no env-var fallback; the SLURM wrapper has to pass
+    # the flag explicitly. Without it, the dataset attaches plain
+    # graph-distance weights and the loss is bit-identical to cb-A
+    # (jobs 611956-611962: cb-A val_loss 0.17151 == cb-B val_loss
+    # 0.17151). Fail fast rather than emit silently invalid results.
+    if branch_tag == "cb-B" and not args.element_aware_weights:
+        raise RuntimeError(
+            "cb-B branch requires --element-aware-weights to activate "
+            "Idea-1B element-aware FM loss weighting. Without this flag "
+            "the run reduces to cb-A (graph-distance only) and produces "
+            "metrics indistinguishable from cb-A.\n"
+            "Fix: pass --element-aware-weights on the CLI, or rerun via "
+            "run_mix_slurm.sh / run_t1x_slurm.sh which now adds the flag "
+            "via the EXTRA_FLAGS case statement on $EXPERIMENT_ID."
+        )
+
     env_run_name = os.environ.get("RUN_NAME")
     if env_run_name:
         # Only append the branch tag if it isn't already present, so
