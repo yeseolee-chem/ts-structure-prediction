@@ -70,6 +70,12 @@ ok()   { printf "  ${color_ok}OK${color_off}    %s\n" "$1"; }
 warn() { printf "  ${color_warn}WARN${color_off}  %s\n" "$1"; }
 fail() { printf "  ${color_err}FAIL${color_off}  %s\n" "$1"; total_fail=$((total_fail+1)); branch_failed=1; }
 
+# ---- Detect environment (UBAI cluster vs laptop) --------------------------
+ON_CLUSTER=0
+if command -v sbatch >/dev/null 2>&1 && command -v squeue >/dev/null 2>&1; then
+    ON_CLUSTER=1
+fi
+
 # ---- Repo-wide static checks (run once, not per branch) -------------------
 echo "==========================================="
 echo "preflight_check.sh"
@@ -78,6 +84,7 @@ echo "PARENT_DIR : $PARENT_DIR"
 echo "BRANCHES   : $BRANCHES"
 echo "WRAPPERS   : $WRAPPERS"
 echo "SMOKE      : $DO_SMOKE"
+echo "ON_CLUSTER : $ON_CLUSTER (sbatch/squeue $([ "$ON_CLUSTER" = 1 ] && echo present || echo missing))"
 echo "==========================================="
 echo ""
 echo "=== Repo-wide checks ==="
@@ -103,6 +110,43 @@ if [ -f "$REPO_ROOT/plot_metrics.py" ]; then
 else
     fail "plot_metrics.py not found at $REPO_ROOT"
 fi
+
+# UBAI cluster-specific checks. Only run when sbatch/squeue are available;
+# otherwise we're on a laptop / dev machine and these checks are irrelevant.
+if [ "$ON_CLUSTER" = "1" ]; then
+    for cmd in sbatch squeue scancel pestat sinfo; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            ok "$cmd available"
+        else
+            warn "$cmd not on PATH (might be available via 'module load')"
+        fi
+    done
+    # Conda env that the slurm scripts will `conda activate`. Defaults to
+    # 'reactot' per the run_*_slurm.sh scripts; override via $CONDA_ENV.
+    cenv=${CONDA_ENV:-reactot}
+    if command -v conda >/dev/null 2>&1; then
+        if conda env list 2>/dev/null | awk '{print $1}' | grep -qx "$cenv"; then
+            ok "conda env '$cenv' exists"
+        else
+            fail "conda env '$cenv' not found — slurm scripts will fail at 'conda activate $cenv'"
+        fi
+    else
+        fail "'conda' not on PATH — install miniconda or 'source ~/.bashrc' (UBAI guide step 4)"
+    fi
+    # Halo8 data symlink target.
+    halo_src=${HALO8_SOURCE:-"$HOME/projects/ts_prediction_project/data"}
+    if [ -d "$halo_src" ]; then
+        n=$(find -L "$halo_src" -maxdepth 1 -name "Halo*.db" 2>/dev/null | wc -l)
+        if [ "$n" -gt 0 ]; then
+            ok "Halo8 data: $n .db files at $halo_src"
+        else
+            fail "Halo8 source $halo_src exists but contains 0 Halo*.db files"
+        fi
+    else
+        fail "Halo8 source dir $halo_src does not exist (slurm scripts will fail to symlink data)"
+    fi
+fi
+
 [ "$branch_failed" -eq 0 ] && total_pass=$((total_pass+1)) || per_branch_fail="$per_branch_fail repo"
 echo ""
 
