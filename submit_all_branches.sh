@@ -80,6 +80,14 @@
 #   BRANCHES="cb-A cb-B" bash submit_all_branches.sh            # subset
 #   DATA_LIMIT=300 bash submit_all_branches.sh                  # smaller subset
 #   DRY_RUN=1 bash submit_all_branches.sh                       # show plan only
+#
+# Recommended SSH workflow on UBAI cluster (gate1/gate2):
+#   ssh -i ~/.ssh/yeseo1ee.pem yeseo1ee@172.16.xxx.xxx          # IP from email
+#   cd ~/projects/ts-structure-prediction
+#   bash tools/cluster_setup.sh                                 # pull all branches + preflight
+#   bash submit_all_branches.sh                                 # only if preflight OK
+#   squeue -u $USER                                             # confirm jobs queued
+#   tail -f logs/mix_<jobid>.out                                # watch progress
 # ===========================================================================
 set -u
 
