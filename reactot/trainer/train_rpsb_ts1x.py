@@ -380,6 +380,35 @@ def main(argv=None):
     # on a checkpoint directory (was the root cause of identical val_rmsd
     # across reactot-halo8/cb-D Mix and reactot-halo8 T1x/cb-BCD).
     branch_tag = _git_branch_tag()
+
+    # Idea-1BCD activation guard. cb-BCD's distinguishing behaviour is
+    # the learnable per-atom importance head with KL regularization
+    # toward the BC prior. Both --prior-scheme and --learn-importance
+    # default off (prior_scheme defaults to None, learn_importance to
+    # False); the BCD prior block in build_configs is skipped when
+    # prior_scheme is None, so without these flags the run reduces to
+    # reactot-halo8 baseline (no atom weighting) and produces bit-
+    # identical metrics (jobs 611956-611962: reactot-halo8 val_loss
+    # 0.16513 == cb-BCD val_loss 0.16513). Fail fast rather than emit
+    # silently invalid results.
+    if branch_tag == "cb-BCD" and (
+        args.prior_scheme is None or not args.learn_importance
+    ):
+        raise RuntimeError(
+            f"cb-BCD branch requires --prior-scheme=BC AND "
+            f"--learn-importance to activate Idea-1BCD (BC prior + "
+            f"learnable importance head). Got "
+            f"prior_scheme={args.prior_scheme!r} "
+            f"learn_importance={args.learn_importance}. Without both, "
+            f"the run reduces to reactot-halo8 baseline (no atom "
+            f"weighting) and produces metrics indistinguishable from "
+            f"baseline.\n"
+            f"Fix: pass --prior-scheme=BC --learn-importance on the "
+            f"CLI, or rerun via run_mix_slurm.sh / run_t1x_slurm.sh "
+            f"which now adds both via the EXTRA_FLAGS case statement "
+            f"on $EXPERIMENT_ID."
+        )
+
     env_run_name = os.environ.get("RUN_NAME")
     if env_run_name:
         # Only append the branch tag if it isn't already present, so
