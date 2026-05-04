@@ -48,6 +48,12 @@ class EnSB(nn.Module):
         sigma: float = 0.0,
         ts_guess: bool = False,
         idx: int = 1,
+        x0_method: str = "midpoint",
+        idpp_max_iter: int = 200,
+        idpp_tol: float = 0.01,
+        idpp_lr: float = 0.01,
+        clash_kappa: float = 10.0,
+        use_clash_penalty: bool = True,
     ):
         super().__init__()
         assert loss_type in {"vlb", "l2"}
@@ -72,7 +78,23 @@ class EnSB(nn.Module):
         self.sigma = sigma
         self.ts_guess = ts_guess
         self.idx = idx
-        
+
+        # Combo [BD]: x_0 generator config.
+        # x0_method ∈ {"midpoint", "idpp", "linear",
+        #              "idpp_clash", "ic", "b_d"}.
+        valid_x0 = {"midpoint", "idpp", "linear",
+                    "idpp_clash", "ic", "b_d"}
+        if x0_method not in valid_x0:
+            raise ValueError(
+                f"x0_method={x0_method!r} not in {sorted(valid_x0)}"
+            )
+        self.x0_method = x0_method
+        self.idpp_max_iter = idpp_max_iter
+        self.idpp_tol = idpp_tol
+        self.idpp_lr = idpp_lr
+        self.clash_kappa = clash_kappa
+        self.use_clash_penalty = use_clash_penalty
+
         if idx == 1:
             assert mapping.split(">")[-1] == "TS"
         elif idx == 2:
@@ -81,6 +103,21 @@ class EnSB(nn.Module):
             assert mapping.split(">")[-1] == "R"
         else:
             pass
+
+    def _compute_x0(self, r_pos, p_pos, t_size, t_other):
+        """Compute the OT-FM initial guess x_0 according to self.x0_method."""
+        if self.x0_method == "midpoint":
+            return 0.5 * (r_pos + p_pos)
+        return utils.idpp_guess(
+            r_pos, p_pos, t_size, t_other,
+            n_images=3,
+            interpolate=self.x0_method,
+            use_clash_penalty=self.use_clash_penalty,
+            idpp_max_iter=self.idpp_max_iter,
+            idpp_tol=self.idpp_tol,
+            idpp_lr=self.idpp_lr,
+            clash_kappa=self.clash_kappa,
+        )
 
     # ------ FORWARD PASS ------
     def sample_batch(
@@ -118,14 +155,9 @@ class EnSB(nn.Module):
 
         elif self.mapping == "R+P->TS":
             if self.mapping_initial == 'RP':
-                # if training:
-                #     factor = torch.randn(1)[0] * self.sigma + 0.5
-                #     factor = 1 if factor > 1 else factor
-                #     factor = 0 if factor < 0 else factor
-                #     x1 = r_pos * factor + p_pos * (1 - factor)
-                # else:
-                #     x1 = (r_pos+p_pos) / 2
-                x1 = (r_pos+p_pos) / 2
+                # Combo [BD]: route through x0_method ('midpoint' preserves
+                # the original (R+P)/2 behaviour exactly).
+                x1 = self._compute_x0(r_pos, p_pos, t_size, t_other)
             elif self.mapping_initial == 'GUESS' and self.ts_guess:
                 x1 = conditions["ts_guess"].float().to(r_pos.device)
             elif self.mapping_initial == 'R':

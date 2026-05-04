@@ -299,6 +299,19 @@ def main(argv=None):
     sigma: float = 0.0
     ts_guess = None
 
+    # Combo [BD]: IC interpolation -> GFN2-xTB short refinement.
+    # IC fallback to IDPP on failure (NaN / convergence). Pre-compute the
+    # x0 cache via scripts/precompute_x0_xtb.py for production runs.
+    x0_config = {
+        'x0_method': 'b_d',  # "midpoint" | "idpp" | "linear" |
+                             # "idpp_clash" | "ic" | "b_d"
+        'idpp_max_iter': 200,
+        'idpp_tol': 0.01,
+        'idpp_lr': 0.01,
+        'clash_kappa': 10.0,
+        'use_clash_penalty': True,
+    }
+
     # Use a stable RUN_NAME from env when provided so the checkpoint dir is
     # predictable across resubmissions. When a SLURM job hits its walltime
     # and is resubmitted, the new run lands in the same directory and can
@@ -362,6 +375,7 @@ def main(argv=None):
         inv_power=inv_power,
         sigma=sigma,
         ts_guess=ts_guess,
+        **x0_config,
     )
     ddpm.ddpm.opt = opt
 
