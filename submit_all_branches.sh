@@ -135,7 +135,7 @@ failed_jobs=""
 # caller can do `WT=$(ensure_worktree X)` cleanly. Returns 1 on failure.
 ensure_worktree() {
     local B="$1"
-    local existing wt
+    local existing wt existing_real repo_real
 
     existing=$(git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null \
         | awk -v b="refs/heads/$B" '
@@ -144,6 +144,29 @@ ensure_worktree() {
         ')
 
     if [ -n "$existing" ]; then
+        # Refuse to use the main repo for any branch OTHER than cb-AB. The
+        # main repo's HEAD is volatile (fixes / cherry-picks / cleanup land
+        # here constantly), and every parallel SLURM job would import the
+        # source from whatever HEAD points to at job-start time, NOT the
+        # branch tag SLURM was queued with. This is the cb-C / job-612178
+        # incident: main repo happened to be on cb-C at submit, so cb-C ran
+        # from /gpfs/.../ts-structure-prediction/ (proven by the leftnet.py
+        # warning path in mix_612178.err) instead of a dedicated worktree.
+        # cb-AB is a documented exception: by convention it always lives in
+        # the main repo (memory: "main repo at <repo> holds cb-AB").
+        existing_real=$(cd "$existing" 2>/dev/null && pwd -P)
+        repo_real=$(cd "$REPO_ROOT" 2>/dev/null && pwd -P)
+        if [ -n "$existing_real" ] && [ "$existing_real" = "$repo_real" ] \
+                && [ "$B" != "cb-AB" ]; then
+            echo "ERROR: branch '$B' is checked out in main repo $REPO_ROOT" >&2
+            echo "       Only cb-AB may live in the main repo (its HEAD is" >&2
+            echo "       volatile and would contaminate parallel runs)." >&2
+            echo "       Fix on the cluster:" >&2
+            echo "         git -C $REPO_ROOT switch cb-AB" >&2
+            echo "         git -C $REPO_ROOT worktree add $PARENT_DIR/ts-prediction-$B $B" >&2
+            echo "       Then re-run this script." >&2
+            return 1
+        fi
         echo "Reusing existing worktree for $B at: $existing" >&2
         echo "$existing"
         return 0
