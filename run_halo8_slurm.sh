@@ -314,7 +314,30 @@ if [ -n "$WANDB_FLAG" ]; then
     echo "=========================================="
     echo "Generating plots from CSV metrics..."
     echo "=========================================="
-    python -u plot_metrics.py || echo "WARN: plot_metrics.py failed (non-fatal)"
+    # Pass --csv EXPLICITLY. plot_metrics.py's no-arg fallback walks logs/
+    # and picks the newest metrics.csv by mtime — when 10 cb-* jobs share
+    # one symlinked logs/ directory, that "newest" file is usually a
+    # CONCURRENTLY-RUNNING different job's CSV, so the printed RMSD summary
+    # and the results/<run>_rmsd_summary.txt file end up labelled with the
+    # wrong RUN_NAME (jobs 612171/612172/612173/612174/612177 incident).
+    EXPECTED_CSV="$REPO_DIR/logs/$RUN_NAME/$RUN_NAME/version_0/metrics.csv"
+    if [ ! -f "$EXPECTED_CSV" ]; then
+        echo "WARN: expected metrics.csv not found at: $EXPECTED_CSV"
+        echo "      (training may have crashed before any val epoch — skipping plots)"
+    else
+        python -u plot_metrics.py --csv "$EXPECTED_CSV" \
+            || echo "WARN: plot_metrics.py failed (non-fatal)"
+        EXPECTED_RESULT="$REPO_DIR/results/${RUN_NAME}_rmsd_summary.txt"
+        if [ ! -f "$EXPECTED_RESULT" ]; then
+            echo "ERROR: post-training summary missing at expected path:"
+            echo "       $EXPECTED_RESULT"
+            echo "       plot_metrics.py wrote elsewhere — DO NOT trust other"
+            echo "       result files in this directory until rerunning manually:"
+            echo "       python -u plot_metrics.py --csv $EXPECTED_CSV"
+        else
+            echo "OK   : RESULT verified at $EXPECTED_RESULT"
+        fi
+    fi
 fi
 
 exit $EXIT_CODE
