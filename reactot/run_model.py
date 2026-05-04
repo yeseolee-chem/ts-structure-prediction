@@ -299,3 +299,45 @@ def pred_ts(rxyz, pxyz, opt, output_path):
     
     return True  # Return True if the function runs successfully
 
+
+# ---------------------------------------------------------------------------
+# Combo [FE] inference helper
+# ---------------------------------------------------------------------------
+
+def predict_ts_FE(
+    model,
+    learned_x0_checkpoint: str,
+    pos_R, pos_P, atomic_numbers,
+    K: int = 5,
+    sigma_base: float = 0.1,
+    nfe: int = 10,
+    seed=None,
+    selection_method: str = 'rmsd_consensus',
+    device: str = 'cpu',
+    atom_weights=None,
+):
+    """Combo [FE] full inference pipeline."""
+    from reactot.utils.initial_guess import (
+        compute_x0_FE, select_best_from_ensemble, ensemble_diversity_stats,
+    )
+    x0_ensemble = compute_x0_FE(
+        pos_R, pos_P, atomic_numbers,
+        learned_x0_checkpoint=learned_x0_checkpoint,
+        K=K, sigma_base=sigma_base, seed=seed,
+        device=device, atom_weights=atom_weights,
+    )
+    ts_ensemble = model.ode_sampling_ensemble(
+        x0_ensemble,
+        conditions={'atomic_numbers': atomic_numbers},
+        nfe=nfe,
+    )
+    best_ts, best_idx = select_best_from_ensemble(
+        ts_ensemble, pos_R, pos_P, method=selection_method,
+    )
+    diversity = ensemble_diversity_stats(ts_ensemble)
+    return {
+        'best_ts': best_ts, 'best_idx': best_idx,
+        'ts_ensemble': ts_ensemble, 'diversity': diversity,
+        'x0_ensemble': x0_ensemble,
+    }
+

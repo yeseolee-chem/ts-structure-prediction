@@ -33,8 +33,12 @@ env/
 
 # Run artifacts (these can grow huge — keep them local)
 checkpoint/
+checkpoints/
 logs/
 results/
 wandb/
 ref_ts/
 sb/
+
+# Combo [FE]: x_0 predictor training data caches
+data/x0_training_data/

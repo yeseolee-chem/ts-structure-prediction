@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import math
 import torch
@@ -85,31 +85,70 @@ def space_indices(num_steps, count):
     return taken_steps
 
 
-def idpp_guess(r_pos, p_pos, x0_size, x0_other, n_images=3, interpolate="idpp"):
-    _r_pos = torch.tensor_split(
-        r_pos,
-        torch.cumsum(x0_size, dim=0).to("cpu")[:-1]
-    )
-    _p_pos = torch.tensor_split(
-        p_pos,
-        torch.cumsum(x0_size, dim=0).to("cpu")[:-1]
-    )
-    z = torch.tensor_split(
-        x0_other[:, -1],
-        torch.cumsum(x0_size, dim=0).to("cpu")[:-1]
-    )
+def idpp_guess(r_pos, p_pos, x0_size, x0_other,
+               n_images=3,
+               interpolate="idpp",
+               learned_x0_checkpoint: Optional[str] = None,
+               ensemble_K=1, ensemble_sigma=0.0, ensemble_seed=None):
+    """
+    Initial-guess interpolator for x_0.
+
+    interpolate ∈ {"idpp", "linear", "learned", "f_e"}
+    - "idpp"     : ASE-NEB IDPP (legacy)
+    - "linear"   : ASE-NEB linear (legacy)
+    - "learned"  : Idea 2-F v2 EGNN x_0 predictor (requires
+                   learned_x0_checkpoint)
+    - "f_e"      : Combo [FE]; training uses K=1, sigma=0
+    """
+    split_indices = torch.cumsum(x0_size, dim=0).to("cpu")[:-1]
+    _r_pos = torch.tensor_split(r_pos, split_indices)
+    _p_pos = torch.tensor_split(p_pos, split_indices)
+    z = torch.tensor_split(x0_other[:, -1], split_indices)
     z = [_z.long().cpu().numpy() for _z in z]
+
+    device_str = "cuda" if (
+        isinstance(x0_size, torch.Tensor) and x0_size.is_cuda
+    ) else "cpu"
+
+    if interpolate == "learned":
+        if learned_x0_checkpoint is None:
+            raise ValueError(
+                "interpolate='learned'는 learned_x0_checkpoint 경로가 필요합니다"
+            )
+        from reactot.utils.initial_guess import compute_learned_x0
+        ts_pos = []
+        for x_r, x_p, atom_number in zip(_r_pos, _p_pos, z):
+            x0 = compute_learned_x0(
+                x_r.cpu().numpy(), x_p.cpu().numpy(), atom_number,
+                model_checkpoint=learned_x0_checkpoint,
+                device=device_str,
+            )
+            ts_pos.append(torch.tensor(x0, dtype=torch.float32))
+        return torch.concat(ts_pos).to(x0_size.device)
+
+    if interpolate == "f_e":
+        if learned_x0_checkpoint is None:
+            raise ValueError(
+                "interpolate='f_e'는 learned_x0_checkpoint 경로가 필요합니다"
+            )
+        from reactot.utils.initial_guess import compute_x0_FE
+        ts_pos = []
+        for x_r, x_p, atom_number in zip(_r_pos, _p_pos, z):
+            x0_ensemble = compute_x0_FE(
+                x_r.cpu().numpy(), x_p.cpu().numpy(), atom_number,
+                learned_x0_checkpoint=learned_x0_checkpoint,
+                K=max(1, ensemble_K),
+                sigma_base=ensemble_sigma,
+                seed=ensemble_seed,
+                device=device_str,
+            )
+            ts_pos.append(torch.tensor(x0_ensemble[0], dtype=torch.float32))
+        return torch.concat(ts_pos).to(x0_size.device)
 
     ts_pos = []
     for x_r, x_p, atom_number in zip(_r_pos, _p_pos, z):
-        mol_r = Atoms(
-            numbers=atom_number,
-            positions=x_r.cpu().numpy(),
-        )
-        mol_p = Atoms(
-            numbers=atom_number,
-            positions=x_p.cpu().numpy(),
-        )
+        mol_r = Atoms(numbers=atom_number, positions=x_r.cpu().numpy())
+        mol_p = Atoms(numbers=atom_number, positions=x_p.cpu().numpy())
 
         images = [mol_r.copy()]
         for _ in range(n_images - 2):
@@ -122,16 +161,18 @@ def idpp_guess(r_pos, p_pos, x0_size, x0_other, n_images=3, interpolate="idpp"):
         neb = NEB(images)
         if interpolate == "idpp":
             neb.idpp_interpolate(
-                traj=None, log=None, fmax=1000, optimizer=ase.optimize.MDMin, mic=False, steps=0)
+                traj=None, log=None, fmax=1000,
+                optimizer=ase.optimize.MDMin, mic=False, steps=0)
         elif interpolate == "linear":
             neb.interpolate('linear')
         else:
-            raise ValueError("interpolate can only be idpp or linear")
+            raise ValueError(
+                "interpolate must be one of: idpp, linear, learned, f_e"
+            )
         x_ts = torch.tensor(
             neb.images[n_images // 2].arrays["positions"],
             dtype=torch.float32,
         )
         ts_pos.append(x_ts)
 
-    ts_pos = torch.concat(ts_pos).to(x0_size.device)
-    return ts_pos
+    return torch.concat(ts_pos).to(x0_size.device)

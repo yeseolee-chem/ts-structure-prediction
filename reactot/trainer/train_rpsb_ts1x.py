@@ -299,6 +299,21 @@ def main(argv=None):
     sigma: float = 0.0
     ts_guess = None
 
+    # Combo [FE]: Learned x_0 predictor + stochastic ensemble. Requires a
+    # trained X0PredictorEGNN checkpoint (see scripts/train_x0_predictor.py).
+    # Set x0_method='midpoint' to recover legacy behaviour without a model.
+    x0_config = {
+        'x0_method': 'f_e',  # "midpoint" | "idpp" | "linear" |
+                             # "learned" | "f_e"
+        'learned_x0_checkpoint': os.environ.get(
+            "LEARNED_X0_CHECKPOINT",
+            "checkpoints/x0_predictor/x0_pred_epoch100.pt",
+        ),
+        'ensemble_K_train': 1,
+        'ensemble_sigma_train': 0.0,
+        'ensemble_seed': 42,
+    }
+
     # Use a stable RUN_NAME from env when provided so the checkpoint dir is
     # predictable across resubmissions. When a SLURM job hits its walltime
     # and is resubmitted, the new run lands in the same directory and can
@@ -362,6 +377,7 @@ def main(argv=None):
         inv_power=inv_power,
         sigma=sigma,
         ts_guess=ts_guess,
+        **x0_config,
     )
     ddpm.ddpm.opt = opt
 
