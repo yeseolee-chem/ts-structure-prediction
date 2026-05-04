@@ -48,6 +48,10 @@ class EnSB(nn.Module):
         sigma: float = 0.0,
         ts_guess: bool = False,
         idx: int = 1,
+        x0_method: str = "midpoint",
+        ensemble_K_train: int = 1,
+        ensemble_sigma_train: float = 0.0,
+        ensemble_seed: Optional[int] = None,
     ):
         super().__init__()
         assert loss_type in {"vlb", "l2"}
@@ -72,7 +76,18 @@ class EnSB(nn.Module):
         self.sigma = sigma
         self.ts_guess = ts_guess
         self.idx = idx
-        
+
+        # Combo [CE]: x_0 generator config.
+        valid_x0 = {"midpoint", "idpp", "linear", "vdw_midpoint", "c_e"}
+        if x0_method not in valid_x0:
+            raise ValueError(
+                f"x0_method={x0_method!r} not in {sorted(valid_x0)}"
+            )
+        self.x0_method = x0_method
+        self.ensemble_K_train = ensemble_K_train
+        self.ensemble_sigma_train = ensemble_sigma_train
+        self.ensemble_seed = ensemble_seed
+
         if idx == 1:
             assert mapping.split(">")[-1] == "TS"
         elif idx == 2:
@@ -81,6 +96,18 @@ class EnSB(nn.Module):
             assert mapping.split(">")[-1] == "R"
         else:
             pass
+
+    def _compute_x0(self, r_pos, p_pos, t_size, t_other):
+        if self.x0_method == "midpoint":
+            return 0.5 * (r_pos + p_pos)
+        return utils.idpp_guess(
+            r_pos, p_pos, t_size, t_other,
+            n_images=3,
+            interpolate=self.x0_method,
+            ensemble_K=self.ensemble_K_train,
+            ensemble_sigma=self.ensemble_sigma_train,
+            ensemble_seed=self.ensemble_seed,
+        )
 
     # ------ FORWARD PASS ------
     def sample_batch(
@@ -118,14 +145,8 @@ class EnSB(nn.Module):
 
         elif self.mapping == "R+P->TS":
             if self.mapping_initial == 'RP':
-                # if training:
-                #     factor = torch.randn(1)[0] * self.sigma + 0.5
-                #     factor = 1 if factor > 1 else factor
-                #     factor = 0 if factor < 0 else factor
-                #     x1 = r_pos * factor + p_pos * (1 - factor)
-                # else:
-                #     x1 = (r_pos+p_pos) / 2
-                x1 = (r_pos+p_pos) / 2
+                # Combo [CE]: route through x0_method.
+                x1 = self._compute_x0(r_pos, p_pos, t_size, t_other)
             elif self.mapping_initial == 'GUESS' and self.ts_guess:
                 x1 = conditions["ts_guess"].float().to(r_pos.device)
             elif self.mapping_initial == 'R':
@@ -453,21 +474,19 @@ class EnSB(nn.Module):
 
     @torch.no_grad()
     def sample(self, x1, representations, conditions,
-               clip_denoise=True, nfe=None, log_count=10, verbose=False, ot_ode=True):
+               clip_denoise=True, nfe=None, log_count=10, verbose=False, ot_ode=True,
+               x1_override=None):
+        """Reverse-time sampler. ``x1_override`` (Tensor) replaces sample_batch
+        x1 — entry point for Combo [CE] stochastic ensemble."""
 
-        # create discrete time steps that split [0, INTERVAL] into NFE sub-intervals.
-        # e.g., if NFE=2 & INTERVAL=1000, then STEPS=[0, 500, 999] and 2 network
-        # evaluations will be invoked, first from 999 to 500, then from 500 to 0.
         nfe = nfe or self.T - 1
         assert 0 < nfe < self.T == len(self.schedule.betas)
         steps = utils.space_indices(self.T, nfe + 1)
 
-        # create log steps
         log_count = min(len(steps)-1, log_count)
         log_steps = [steps[i] for i in utils.space_indices(len(steps)-1, log_count)]
         assert log_steps[0] == 0
 
-        # Prepare data for inference
         masks = [repre["mask"] for repre in representations]
         combined_mask = torch.cat(masks)
         edge_index = get_edges_index(combined_mask, remove_self_edge=True)
@@ -476,6 +495,10 @@ class EnSB(nn.Module):
 
         x0, x1, cond, x0_size, x0_other = self.sample_batch(
             representations, conditions, return_timesteps=False, training=True)
+
+        if x1_override is not None:
+            x1_override = x1_override.to(x1.device).to(x1.dtype)
+            x1 = utils.remove_mean_batch(x1_override, cond["ts_mask"])
 
         xh_t = [
             torch.cat(
@@ -548,6 +571,28 @@ class EnSB(nn.Module):
         torch.cuda.empty_cache()
 
         return xs, pred_x0
+
+    @torch.no_grad()
+    def ode_sampling_ensemble(
+        self, x1_ensemble, representations, conditions,
+        clip_denoise: bool = True,
+        nfe: Optional[int] = None,
+        log_count: int = 10,
+        verbose: bool = False,
+        ot_ode: bool = True,
+    ):
+        """Combo [CE]: drive sampler K times with perturbed x1 candidates."""
+        ts_ensemble = []
+        for x1_k in x1_ensemble:
+            xs, _ = self.sample(
+                x1_k, representations, conditions,
+                clip_denoise=clip_denoise, nfe=nfe,
+                log_count=log_count, verbose=verbose, ot_ode=ot_ode,
+                x1_override=x1_k,
+            )
+            ts_pred = xs[:, 0, ...].detach().cpu()
+            ts_ensemble.append(ts_pred)
+        return ts_ensemble
 
     ###################Exponential Integrator
     def EI_ODE(self, t, x_n, x0, idx, r, ot_ode=False):

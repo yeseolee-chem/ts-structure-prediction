@@ -299,6 +299,16 @@ def main(argv=None):
     sigma: float = 0.0
     ts_guess = None
 
+    # Combo [CE]: vdW-corrected midpoint + stochastic ensemble.
+    # 가장 가벼운 ensemble baseline. Training uses K=1, sigma=0.
+    x0_config = {
+        'x0_method': 'c_e',  # "midpoint" | "idpp" | "linear" |
+                             # "vdw_midpoint" | "c_e"
+        'ensemble_K_train': 1,
+        'ensemble_sigma_train': 0.0,
+        'ensemble_seed': 42,
+    }
+
     # Use a stable RUN_NAME from env when provided so the checkpoint dir is
     # predictable across resubmissions. When a SLURM job hits its walltime
     # and is resubmitted, the new run lands in the same directory and can
@@ -362,6 +372,7 @@ def main(argv=None):
         inv_power=inv_power,
         sigma=sigma,
         ts_guess=ts_guess,
+        **x0_config,
     )
     ddpm.ddpm.opt = opt
 
