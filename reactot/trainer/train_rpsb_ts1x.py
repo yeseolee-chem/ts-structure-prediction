@@ -425,6 +425,25 @@ def main(argv=None):
     # on a checkpoint directory (was the root cause of identical val_rmsd
     # across reactot-halo8/cb-D Mix and reactot-halo8 T1x/cb-BCD).
     branch_tag = _git_branch_tag()
+
+    # Idea-1BC activation guard. cb-BC's distinguishing behaviour is the
+    # 3-tier x alpha_Z + bond-angle kernel (compute_bc_weights).
+    # --weighting-scheme defaults to "AB" (inherited from cb-AB), so
+    # without an explicit override the dataset routes through the AB
+    # hybrid kernel and the loss is bit-identical to cb-AB. Fail fast
+    # rather than emit silently invalid results.
+    if branch_tag == "cb-BC" and args.weighting_scheme != "BC":
+        raise RuntimeError(
+            f"cb-BC branch requires --weighting-scheme=BC to activate "
+            f"the BC kernel (3-tier x alpha_Z + bond-angle). Got "
+            f"weighting_scheme={args.weighting_scheme!r}, which reduces "
+            f"to cb-AB's AB hybrid kernel and produces metrics "
+            f"indistinguishable from cb-AB.\n"
+            f"Fix: pass --weighting-scheme=BC on the CLI, or rerun via "
+            f"run_mix_slurm.sh / run_t1x_slurm.sh which now adds the "
+            f"flag via the EXTRA_FLAGS case statement on $EXPERIMENT_ID."
+        )
+
     env_run_name = os.environ.get("RUN_NAME")
     if env_run_name:
         # Only append the branch tag if it isn't already present, so
