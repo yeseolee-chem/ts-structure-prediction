@@ -78,6 +78,15 @@ class SBModule(LightningModule):
         ts_guess: bool = False,
         idx: int = 1,
         pbc: bool = False,
+        x0_method: str = "midpoint",
+        idpp_max_iter: int = 200,
+        idpp_tol: float = 0.01,
+        idpp_lr: float = 0.01,
+        clash_kappa: float = 10.0,
+        use_clash_penalty: bool = True,
+        ensemble_K_train: int = 1,
+        ensemble_sigma_train: float = 0.0,
+        ensemble_seed: Optional[int] = None,
     ) -> None:
         super().__init__()
         egnn_dynamics = EGNNDynamics(
@@ -121,6 +130,15 @@ class SBModule(LightningModule):
             sigma=sigma,
             ts_guess=ts_guess,
             idx=idx,
+            x0_method=x0_method,
+            idpp_max_iter=idpp_max_iter,
+            idpp_tol=idpp_tol,
+            idpp_lr=idpp_lr,
+            clash_kappa=clash_kappa,
+            use_clash_penalty=use_clash_penalty,
+            ensemble_K_train=ensemble_K_train,
+            ensemble_sigma_train=ensemble_sigma_train,
+            ensemble_seed=ensemble_seed,
         )
         self.model_config = model_config
         self.optimizer_config = optimizer_config

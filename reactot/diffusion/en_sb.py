@@ -48,6 +48,15 @@ class EnSB(nn.Module):
         sigma: float = 0.0,
         ts_guess: bool = False,
         idx: int = 1,
+        x0_method: str = "midpoint",
+        idpp_max_iter: int = 200,
+        idpp_tol: float = 0.01,
+        idpp_lr: float = 0.01,
+        clash_kappa: float = 10.0,
+        use_clash_penalty: bool = True,
+        ensemble_K_train: int = 1,
+        ensemble_sigma_train: float = 0.0,
+        ensemble_seed: Optional[int] = None,
     ):
         super().__init__()
         assert loss_type in {"vlb", "l2"}
@@ -72,7 +81,31 @@ class EnSB(nn.Module):
         self.sigma = sigma
         self.ts_guess = ts_guess
         self.idx = idx
-        
+
+        # Combo [ADE]: x_0 generator config.
+        # x0_method ∈ {"midpoint", "idpp", "linear",
+        #              "idpp_clash", "xtb_refine",
+        #              "a_d", "a_e", "a_d_e"}.
+        # Only consulted when mapping_initial == 'RP'.
+        valid_x0 = {"midpoint", "idpp", "linear",
+                    "idpp_clash", "xtb_refine",
+                    "a_d", "a_e", "a_d_e"}
+        if x0_method not in valid_x0:
+            raise ValueError(
+                f"x0_method={x0_method!r} not in {sorted(valid_x0)}"
+            )
+        self.x0_method = x0_method
+        self.idpp_max_iter = idpp_max_iter
+        self.idpp_tol = idpp_tol
+        self.idpp_lr = idpp_lr
+        self.clash_kappa = clash_kappa
+        self.use_clash_penalty = use_clash_penalty
+        # Train-time ensemble: K=1, sigma=0 -> deterministic (refined base).
+        # Inference uses ode_sampling_ensemble with caller-supplied K.
+        self.ensemble_K_train = ensemble_K_train
+        self.ensemble_sigma_train = ensemble_sigma_train
+        self.ensemble_seed = ensemble_seed
+
         if idx == 1:
             assert mapping.split(">")[-1] == "TS"
         elif idx == 2:
@@ -81,6 +114,24 @@ class EnSB(nn.Module):
             assert mapping.split(">")[-1] == "R"
         else:
             pass
+
+    def _compute_x0(self, r_pos, p_pos, t_size, t_other):
+        """Compute the OT-FM initial guess x_0 according to self.x0_method."""
+        if self.x0_method == "midpoint":
+            return 0.5 * (r_pos + p_pos)
+        return utils.idpp_guess(
+            r_pos, p_pos, t_size, t_other,
+            n_images=3,
+            interpolate=self.x0_method,
+            use_clash_penalty=self.use_clash_penalty,
+            idpp_max_iter=self.idpp_max_iter,
+            idpp_tol=self.idpp_tol,
+            idpp_lr=self.idpp_lr,
+            clash_kappa=self.clash_kappa,
+            ensemble_K=self.ensemble_K_train,
+            ensemble_sigma=self.ensemble_sigma_train,
+            ensemble_seed=self.ensemble_seed,
+        )
 
     # ------ FORWARD PASS ------
     def sample_batch(
@@ -118,14 +169,9 @@ class EnSB(nn.Module):
 
         elif self.mapping == "R+P->TS":
             if self.mapping_initial == 'RP':
-                # if training:
-                #     factor = torch.randn(1)[0] * self.sigma + 0.5
-                #     factor = 1 if factor > 1 else factor
-                #     factor = 0 if factor < 0 else factor
-                #     x1 = r_pos * factor + p_pos * (1 - factor)
-                # else:
-                #     x1 = (r_pos+p_pos) / 2
-                x1 = (r_pos+p_pos) / 2
+                # Combo [ADE]: route through x0_method. The "midpoint" mode
+                # preserves the original (R+P)/2 behaviour exactly.
+                x1 = self._compute_x0(r_pos, p_pos, t_size, t_other)
             elif self.mapping_initial == 'GUESS' and self.ts_guess:
                 x1 = conditions["ts_guess"].float().to(r_pos.device)
             elif self.mapping_initial == 'R':
@@ -453,7 +499,17 @@ class EnSB(nn.Module):
 
     @torch.no_grad()
     def sample(self, x1, representations, conditions,
-               clip_denoise=True, nfe=None, log_count=10, verbose=False, ot_ode=True):
+               clip_denoise=True, nfe=None, log_count=10, verbose=False, ot_ode=True,
+               x1_override=None):
+        """Reverse-time sampler.
+
+        ``x1_override``: optional Tensor that, if provided, replaces the
+        x1 produced by ``sample_batch`` (after ts_mask CoG removal). This
+        is the entry point for the Idea 2-E stochastic ensemble — callers
+        compute K perturbed candidates with
+        ``compute_x0_AE`` / ``compute_x0_ADE`` and drive the sampler
+        K times via ``ode_sampling_ensemble``.
+        """
 
         # create discrete time steps that split [0, INTERVAL] into NFE sub-intervals.
         # e.g., if NFE=2 & INTERVAL=1000, then STEPS=[0, 500, 999] and 2 network
@@ -476,6 +532,14 @@ class EnSB(nn.Module):
 
         x0, x1, cond, x0_size, x0_other = self.sample_batch(
             representations, conditions, return_timesteps=False, training=True)
+
+        # Combo [ADE]: stochastic-ensemble entry point. When the caller
+        # supplies a perturbed initial structure, replace the (R+P)/2 / x1
+        # produced above. CoG-removed using the same ts_mask sample_batch
+        # already used so the per-fragment center-of-mass invariant holds.
+        if x1_override is not None:
+            x1_override = x1_override.to(x1.device).to(x1.dtype)
+            x1 = utils.remove_mean_batch(x1_override, cond["ts_mask"])
 
         xh_t = [
             torch.cat(
@@ -548,6 +612,40 @@ class EnSB(nn.Module):
         torch.cuda.empty_cache()
 
         return xs, pred_x0
+
+    @torch.no_grad()
+    def ode_sampling_ensemble(
+        self,
+        x1_ensemble,
+        representations,
+        conditions,
+        clip_denoise: bool = True,
+        nfe: Optional[int] = None,
+        log_count: int = 10,
+        verbose: bool = False,
+        ot_ode: bool = True,
+    ):
+        """
+        Combo [E]/[AE]/[ADE]: drive the reverse-time sampler K times, once
+        per perturbed x1 in ``x1_ensemble``. Each entry should already be
+        a (n_atoms_total, 3) tensor (e.g. row-k of the result of
+        ``compute_x0_ADE``).
+
+        Returns a list of K tensors with the predicted TS at t=0
+        (detached, on CPU). Caller is responsible for selecting / scoring
+        them via ``select_best_from_ensemble``.
+        """
+        ts_ensemble = []
+        for x1_k in x1_ensemble:
+            xs, _ = self.sample(
+                x1_k, representations, conditions,
+                clip_denoise=clip_denoise, nfe=nfe,
+                log_count=log_count, verbose=verbose, ot_ode=ot_ode,
+                x1_override=x1_k,
+            )
+            ts_pred = xs[:, 0, ...].detach().cpu()
+            ts_ensemble.append(ts_pred)
+        return ts_ensemble
 
     ###################Exponential Integrator
     def EI_ODE(self, t, x_n, x0, idx, r, ot_ode=False):

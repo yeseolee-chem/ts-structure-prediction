@@ -299,6 +299,25 @@ def main(argv=None):
     sigma: float = 0.0
     ts_guess = None
 
+    # Combo [ADE]: full pipeline = IDPP -> GFN2-xTB -> stochastic ensemble.
+    # Training uses K=1, sigma=0 (deterministic refined base); inference
+    # callers should use ode_sampling_ensemble with K>=3 for ensemble runs.
+    # See scripts/precompute_x0_xtb.py for batch xTB caching and
+    # scripts/evaluate_ensemble.py for K/sigma ablation.
+    x0_config = {
+        'x0_method': 'a_d_e',  # "midpoint" | "idpp" | "linear" |
+                               # "idpp_clash" | "xtb_refine" |
+                               # "a_d" | "a_e" | "a_d_e"
+        'idpp_max_iter': 200,
+        'idpp_tol': 0.01,
+        'idpp_lr': 0.01,
+        'clash_kappa': 10.0,
+        'use_clash_penalty': True,
+        'ensemble_K_train': 1,
+        'ensemble_sigma_train': 0.0,
+        'ensemble_seed': 42,
+    }
+
     # Use a stable RUN_NAME from env when provided so the checkpoint dir is
     # predictable across resubmissions. When a SLURM job hits its walltime
     # and is resubmitted, the new run lands in the same directory and can
@@ -362,6 +381,7 @@ def main(argv=None):
         inv_power=inv_power,
         sigma=sigma,
         ts_guess=ts_guess,
+        **x0_config,
     )
     ddpm.ddpm.opt = opt
 

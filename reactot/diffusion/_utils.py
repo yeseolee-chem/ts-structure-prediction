@@ -85,31 +85,104 @@ def space_indices(num_steps, count):
     return taken_steps
 
 
-def idpp_guess(r_pos, p_pos, x0_size, x0_other, n_images=3, interpolate="idpp"):
-    _r_pos = torch.tensor_split(
-        r_pos,
-        torch.cumsum(x0_size, dim=0).to("cpu")[:-1]
-    )
-    _p_pos = torch.tensor_split(
-        p_pos,
-        torch.cumsum(x0_size, dim=0).to("cpu")[:-1]
-    )
-    z = torch.tensor_split(
-        x0_other[:, -1],
-        torch.cumsum(x0_size, dim=0).to("cpu")[:-1]
-    )
+def idpp_guess(r_pos, p_pos, x0_size, x0_other,
+               n_images=3,
+               interpolate="idpp",
+               use_clash_penalty=True,
+               idpp_max_iter=200, idpp_tol=0.01, idpp_lr=0.01,
+               clash_kappa=10.0,
+               ensemble_K=1, ensemble_sigma=0.0, ensemble_seed=None):
+    """
+    Initial-guess interpolator for x_0.
+
+    interpolate ∈ {"idpp", "linear", "idpp_clash", "xtb_refine",
+                    "a_d", "a_e", "a_d_e"}
+    - "idpp"       : ASE-NEB IDPP (legacy, EMT-based)
+    - "linear"     : ASE-NEB linear (legacy)
+    - "idpp_clash" : Idea 2-A v2 IDPP + halogen-aware clash penalty
+    - "xtb_refine" : Idea 2-D v2 IDPP -> GFN2-xTB short refinement
+    - "a_d"        : Combo [AD] alias for IDPP -> xTB
+    - "a_e"        : Combo [AE]; training uses K=1, sigma=0 (deterministic)
+    - "a_d_e"      : Combo [ADE]; training uses K=1, sigma=0
+    """
+    split_indices = torch.cumsum(x0_size, dim=0).to("cpu")[:-1]
+    _r_pos = torch.tensor_split(r_pos, split_indices)
+    _p_pos = torch.tensor_split(p_pos, split_indices)
+    z = torch.tensor_split(x0_other[:, -1], split_indices)
     z = [_z.long().cpu().numpy() for _z in z]
+
+    if interpolate == "idpp_clash":
+        from reactot.utils.initial_guess import compute_idpp
+        ts_pos = []
+        for x_r, x_p, atom_number in zip(_r_pos, _p_pos, z):
+            x0 = compute_idpp(
+                pos_R=x_r.cpu().numpy(),
+                pos_P=x_p.cpu().numpy(),
+                atomic_numbers=atom_number,
+                use_clash_penalty=use_clash_penalty,
+                max_iter=idpp_max_iter,
+                tol=idpp_tol, lr=idpp_lr,
+                clash_kappa=clash_kappa,
+            )
+            ts_pos.append(torch.tensor(x0, dtype=torch.float32))
+        return torch.concat(ts_pos).to(x0_size.device)
+
+    if interpolate == "xtb_refine":
+        from reactot.utils.initial_guess import compute_xtb_refined_x0_with_idpp
+        ts_pos = []
+        for x_r, x_p, atom_number in zip(_r_pos, _p_pos, z):
+            x0 = compute_xtb_refined_x0_with_idpp(
+                x_r.cpu().numpy(), x_p.cpu().numpy(), atom_number,
+                idpp_kwargs={'max_iter': idpp_max_iter,
+                             'use_clash_penalty': use_clash_penalty},
+                xtb_kwargs={'max_steps': 20, 'fmax': 0.5},
+            )
+            ts_pos.append(torch.tensor(x0, dtype=torch.float32))
+        return torch.concat(ts_pos).to(x0_size.device)
+
+    if interpolate == "a_d":
+        from reactot.utils.initial_guess import compute_x0_AD
+        ts_pos = []
+        for x_r, x_p, atom_number in zip(_r_pos, _p_pos, z):
+            x0 = compute_x0_AD(
+                x_r.cpu().numpy(), x_p.cpu().numpy(), atom_number,
+                charge=0,
+            )
+            ts_pos.append(torch.tensor(x0, dtype=torch.float32))
+        return torch.concat(ts_pos).to(x0_size.device)
+
+    if interpolate == "a_e":
+        from reactot.utils.initial_guess import compute_x0_AE
+        ts_pos = []
+        for x_r, x_p, atom_number in zip(_r_pos, _p_pos, z):
+            x0_ensemble = compute_x0_AE(
+                x_r.cpu().numpy(), x_p.cpu().numpy(), atom_number,
+                K=max(1, ensemble_K),
+                sigma_base=ensemble_sigma,
+                seed=ensemble_seed,
+            )
+            # Training path: take the first (deterministic) candidate.
+            ts_pos.append(torch.tensor(x0_ensemble[0], dtype=torch.float32))
+        return torch.concat(ts_pos).to(x0_size.device)
+
+    if interpolate == "a_d_e":
+        from reactot.utils.initial_guess import compute_x0_ADE
+        ts_pos = []
+        for x_r, x_p, atom_number in zip(_r_pos, _p_pos, z):
+            x0_ensemble = compute_x0_ADE(
+                x_r.cpu().numpy(), x_p.cpu().numpy(), atom_number,
+                K=max(1, ensemble_K),
+                sigma_base=ensemble_sigma,
+                seed=ensemble_seed,
+                charge=0,
+            )
+            ts_pos.append(torch.tensor(x0_ensemble[0], dtype=torch.float32))
+        return torch.concat(ts_pos).to(x0_size.device)
 
     ts_pos = []
     for x_r, x_p, atom_number in zip(_r_pos, _p_pos, z):
-        mol_r = Atoms(
-            numbers=atom_number,
-            positions=x_r.cpu().numpy(),
-        )
-        mol_p = Atoms(
-            numbers=atom_number,
-            positions=x_p.cpu().numpy(),
-        )
+        mol_r = Atoms(numbers=atom_number, positions=x_r.cpu().numpy())
+        mol_p = Atoms(numbers=atom_number, positions=x_p.cpu().numpy())
 
         images = [mol_r.copy()]
         for _ in range(n_images - 2):
@@ -122,16 +195,19 @@ def idpp_guess(r_pos, p_pos, x0_size, x0_other, n_images=3, interpolate="idpp"):
         neb = NEB(images)
         if interpolate == "idpp":
             neb.idpp_interpolate(
-                traj=None, log=None, fmax=1000, optimizer=ase.optimize.MDMin, mic=False, steps=0)
+                traj=None, log=None, fmax=1000,
+                optimizer=ase.optimize.MDMin, mic=False, steps=0)
         elif interpolate == "linear":
             neb.interpolate('linear')
         else:
-            raise ValueError("interpolate can only be idpp or linear")
+            raise ValueError(
+                "interpolate must be one of: idpp, linear, idpp_clash, "
+                "xtb_refine, a_d, a_e, a_d_e"
+            )
         x_ts = torch.tensor(
             neb.images[n_images // 2].arrays["positions"],
             dtype=torch.float32,
         )
         ts_pos.append(x_ts)
 
-    ts_pos = torch.concat(ts_pos).to(x0_size.device)
-    return ts_pos
+    return torch.concat(ts_pos).to(x0_size.device)

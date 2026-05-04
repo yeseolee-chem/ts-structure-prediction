@@ -1,4 +1,5 @@
 import copy
+import os
 import numpy as np
 import torch
 
@@ -41,8 +42,12 @@ class ProcessedTS1x(BaseDataset):
         ts_guess=False,
         react_type=None,
         atom_mapping=ATOM_MAPPING,
+        x0_cache_dir=None,
         **kwargs,
     ):
+        # Combo [ADE]: optional cache directory for xTB-refined x_0 (npy
+        # files keyed by reaction index). See scripts/precompute_x0_xtb.py.
+        self.x0_cache_dir = x0_cache_dir
         super().__init__(
             npz_path=npz_path,
             center=center,
@@ -156,3 +161,11 @@ class ProcessedTS1x(BaseDataset):
                 torch.zeros(size=(1, 1), dtype=torch.int64, device=self.device,)
                 for _ in range(self.n_samples)
             ]
+
+    def _load_x0(self, idx, pos_R, pos_P, atomic_numbers):
+        """Combo [ADE]: load precomputed x_0 cache, fall back to (R+P)/2."""
+        if self.x0_cache_dir:
+            cache_path = os.path.join(self.x0_cache_dir, f"x0_{idx:06d}.npy")
+            if os.path.exists(cache_path):
+                return np.load(cache_path)
+        return 0.5 * (pos_R + pos_P)
