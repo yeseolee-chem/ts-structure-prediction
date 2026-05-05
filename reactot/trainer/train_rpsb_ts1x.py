@@ -462,9 +462,9 @@ def main(argv=None):
             devices = [0]
 
     trainer_kwargs = dict(
-        # Unlimited epochs — training is bounded by EarlyStopping
-        # (monitor=val_ep_scaled_err, patience=150).
-        max_epochs=-1,
+        # Unlimited epochs by default — training is bounded by EarlyStopping
+        # (monitor=val_ep_scaled_err, patience=150). Set MAX_EPOCHS env var to cap.
+        max_epochs=int(os.environ.get("MAX_EPOCHS", "-1")),
         accelerator=accelerator,
         deterministic=False,
         devices=devices,
