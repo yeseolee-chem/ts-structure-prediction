@@ -165,7 +165,18 @@ echo "=========================================="
 
 if [ -n "$WANDB_FLAG" ]; then
     echo "Generating plots from CSV metrics..."
-    python -u plot_metrics.py || echo "WARN: plot_metrics.py failed (non-fatal)"
+# Pass --csv EXPLICITLY. plot_metrics.py's no-arg fallback walks logs/
+    # and picks the newest metrics.csv by mtime - when many jobs share one
+    # symlinked logs/ directory, that "newest" file is usually a
+    # CONCURRENTLY-RUNNING different job's CSV, mislabelling the summary.
+    EXPECTED_CSV="$REPO_DIR/logs/$RUN_NAME/$RUN_NAME/version_0/metrics.csv"
+    if [ ! -f "$EXPECTED_CSV" ]; then
+        echo "WARN: expected metrics.csv not found at: $EXPECTED_CSV"
+        echo "      (training may have crashed before any val epoch - skipping plots)"
+    else
+        python -u plot_metrics.py --csv "$EXPECTED_CSV" \
+            || echo "WARN: plot_metrics.py failed (non-fatal)"
+    fi
 fi
 
 exit $EXIT_CODE
