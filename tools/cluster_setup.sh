@@ -12,22 +12,23 @@
 #   ssh -i ~/.ssh/yeseo1ee.pem yeseo1ee@172.16.xxx.xxx
 #
 #   # On the cluster (gate1):
-#   cd ~/projects/ts-structure-prediction
+#   cd ~/projects/ts-prediction-cb-AB   # cb-AB is the captain worktree where
+#                                       # tools/ and submit_all_branches.sh live
 #   bash tools/cluster_setup.sh         # pulls all branches + preflight
 #   bash submit_all_branches.sh         # submit only if preflight passed
 #
 # What this script does:
-#   1. Switches the main repo (~/projects/ts-structure-prediction) to cb-AB.
-#      cb-AB is the "captain" branch where fixes land first; submit_all_branches.sh
-#      lives only on cb-AB and is what orchestrates per-worktree training.
-#   2. `git fetch --all` then `git pull --ff-only origin cb-AB` on the main repo.
-#   3. For each cb-* / reactot-halo8 branch, ensures a dedicated worktree
+#   1. `git fetch --all --prune` against the main repo to refresh remote refs.
+#      The main repo's HEAD is left alone — every cb-* branch (including
+#      cb-AB) lives in its own dedicated worktree at
+#      $PARENT_DIR/ts-prediction-<branch>/.
+#   2. For each cb-* / reactot-halo8 branch, ensures a dedicated worktree
 #      lives at $PARENT_DIR/ts-prediction-<branch>/ and pulls origin/<branch>
 #      into it.
-#   4. Strips any __pycache__ that might shadow the freshly-pulled code (this
+#   3. Strips any __pycache__ that might shadow the freshly-pulled code (this
 #      is also done inside run_*_slurm.sh at job start, but cleaning here
 #      makes the preflight result honest).
-#   5. Runs tools/preflight_check.sh and refuses to proceed if any branch
+#   4. Runs tools/preflight_check.sh and refuses to proceed if any branch
 #      reports a contamination-class failure.
 #
 # Re-run this any time you (or another collaborator) push new commits to
@@ -48,42 +49,16 @@ echo "PARENT_DIR : $PARENT_DIR"
 echo "BRANCHES   : $BRANCHES"
 echo "==========================================="
 
-# ---- Step 1: ensure main repo on cb-AB --------------------------------------
-current=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-if [ "$current" != "cb-AB" ]; then
-    echo ""
-    echo "[main repo] currently on '$current', switching to cb-AB..."
-    if ! git -C "$REPO_ROOT" diff --quiet || ! git -C "$REPO_ROOT" diff --cached --quiet; then
-        echo "ERROR: main repo has uncommitted changes; refusing to switch branch." >&2
-        echo "       Stash or commit them first:" >&2
-        echo "         git -C $REPO_ROOT stash" >&2
-        echo "         # or: git -C $REPO_ROOT add -A && git commit -m 'wip'" >&2
-        exit 1
-    fi
-    git -C "$REPO_ROOT" switch cb-AB || {
-        echo "ERROR: 'git switch cb-AB' failed in main repo" >&2
-        exit 1
-    }
-fi
-
-# ---- Step 2: fetch + pull cb-AB into main repo ------------------------------
+# ---- Step 1: refresh remote refs --------------------------------------------
 echo ""
 echo "[main repo] git fetch --all --prune..."
 git -C "$REPO_ROOT" fetch --all --prune || echo "WARN: fetch failed; continuing with stale refs"
-echo "[main repo] git pull --ff-only origin cb-AB..."
-git -C "$REPO_ROOT" pull --ff-only origin cb-AB || {
-    echo "ERROR: cannot fast-forward cb-AB. Diverged history — investigate manually." >&2
-    exit 1
-}
-echo "[main repo] HEAD = $(git -C "$REPO_ROOT" rev-parse --short HEAD)"
 
-# ---- Step 3: per-branch worktree pulls --------------------------------------
+# ---- Step 2: per-branch worktree pulls --------------------------------------
 echo ""
 echo "[per-branch worktrees]"
 fail_branches=""
 for B in $BRANCHES; do
-    [ "$B" = "cb-AB" ] && continue   # cb-AB lives in main repo, already pulled
-
     WT="$PARENT_DIR/ts-prediction-$B"
 
     # Discover where git thinks $B lives.
@@ -131,20 +106,16 @@ for B in $BRANCHES; do
     echo "  $B: HEAD = $(git -C "$WT" rev-parse --short HEAD)"
 done
 
-# ---- Step 4: clean __pycache__ across all worktrees -------------------------
+# ---- Step 3: clean __pycache__ across all worktrees -------------------------
 echo ""
 echo "[__pycache__ cleanup]"
 for B in $BRANCHES; do
-    if [ "$B" = "cb-AB" ]; then
-        WT="$REPO_ROOT"
-    else
-        WT="$PARENT_DIR/ts-prediction-$B"
-        [ -d "$WT" ] || WT=$(git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null \
-            | awk -v b="refs/heads/$B" '
-                /^worktree / { wt = substr($0, 10) }
-                $0 == "branch " b { print wt; exit }
-            ')
-    fi
+    WT="$PARENT_DIR/ts-prediction-$B"
+    [ -d "$WT" ] || WT=$(git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null \
+        | awk -v b="refs/heads/$B" '
+            /^worktree / { wt = substr($0, 10) }
+            $0 == "branch " b { print wt; exit }
+        ')
     [ -n "$WT" ] && [ -d "$WT" ] || continue
     n=$(find "$WT" -type d -name __pycache__ 2>/dev/null | wc -l)
     if [ "$n" -gt 0 ]; then
@@ -153,7 +124,7 @@ for B in $BRANCHES; do
     fi
 done
 
-# ---- Step 5: preflight check ------------------------------------------------
+# ---- Step 4: preflight check ------------------------------------------------
 echo ""
 echo "[preflight check]"
 if [ ! -f "$REPO_ROOT/tools/preflight_check.sh" ]; then
