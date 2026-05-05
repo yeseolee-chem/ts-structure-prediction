@@ -78,8 +78,10 @@ class SBModule(LightningModule):
         ts_guess: bool = False,
         idx: int = 1,
         pbc: bool = False,
+        x0_method: str = "midpoint",
     ) -> None:
         super().__init__()
+        self._x0_method = x0_method
         egnn_dynamics = EGNNDynamics(
             model_config=model_config,
             node_nfs=node_nfs,
@@ -121,6 +123,7 @@ class SBModule(LightningModule):
             sigma=sigma,
             ts_guess=ts_guess,
             idx=idx,
+            x0_method=x0_method,
         )
         self.model_config = model_config
         self.optimizer_config = optimizer_config

@@ -362,6 +362,7 @@ def main(argv=None):
         inv_power=inv_power,
         sigma=sigma,
         ts_guess=ts_guess,
+        x0_method=os.environ.get("X0_METHOD", "idpp"),
     )
     ddpm.ddpm.opt = opt
 

@@ -48,9 +48,13 @@ class EnSB(nn.Module):
         sigma: float = 0.0,
         ts_guess: bool = False,
         idx: int = 1,
+        x0_method: str = "midpoint",
     ):
         super().__init__()
         assert loss_type in {"vlb", "l2"}
+        if x0_method not in {"midpoint", "idpp", "linear"}:
+            raise ValueError(f"Unknown x0_method: {x0_method!r}")
+        self.x0_method = x0_method
 
         self.dynamics = dynamics
         self.schedule = schdule
@@ -81,6 +85,15 @@ class EnSB(nn.Module):
             assert mapping.split(">")[-1] == "R"
         else:
             pass
+
+    def _compute_x0(self, pos_R, pos_P, x0_size, x0_other):
+        """OT-FM initial guess (Idea 2 dispatch)."""
+        if self.x0_method == "midpoint":
+            return 0.5 * (pos_R + pos_P)
+        return utils.idpp_guess(
+            pos_R, pos_P, x0_size, x0_other,
+            interpolate=self.x0_method,
+        )
 
     # ------ FORWARD PASS ------
     def sample_batch(
@@ -125,7 +138,7 @@ class EnSB(nn.Module):
                 #     x1 = r_pos * factor + p_pos * (1 - factor)
                 # else:
                 #     x1 = (r_pos+p_pos) / 2
-                x1 = (r_pos+p_pos) / 2
+                x1 = self._compute_x0(r_pos, p_pos, r_size, r_other)
             elif self.mapping_initial == 'GUESS' and self.ts_guess:
                 x1 = conditions["ts_guess"].float().to(r_pos.device)
             elif self.mapping_initial == 'R':
