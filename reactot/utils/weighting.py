@@ -377,27 +377,30 @@ def compute_element_weights_for_batch(
     custom_alpha: Optional[dict] = None,
 ) -> np.ndarray:
     """
-    전체 파이프라인: 좌표 → core → 거리 → 원소 가중치.
+    Pure element-only weighting (cb-B baseline, per spec).
 
-    Idea 1-A의 compute_weights_for_batch()를 대체한다.
+    Skips the graph-distance kernel entirely — assigns each atom's weight
+    purely from the per-element α_Z table, then normalizes per molecule so
+    the mean weight ≈ 1.0. This makes cb-B distinguishable from cb-AB
+    (which multiplies graph-distance × α_Z); without this fix cb-B silently
+    collapses to cb-AB at 5-decimal precision.
+
+    The pos_R / pos_P / w_min / lambda_decay arguments are kept for API
+    compatibility with compute_weights_for_batch but are unused here.
 
     Args:
-        pos_R: (N, 3) reactant positions
-        pos_P: (N, 3) product positions
         atomic_numbers: (N,) atomic numbers
-        w_min: minimum weight
-        lambda_decay: decay length scale
-        custom_alpha: 사용자 정의 α_Z (grid search 시 사용)
+        custom_alpha: per-element α_Z override (grid search 시 사용)
 
     Returns:
-        weights: (N,) element-aware continuous weights (normalized to mean ~1.0)
+        weights: (N,) element-only continuous weights (normalized to mean ~1.0)
     """
-    core = find_reactive_core_from_positions(pos_R, pos_P, atomic_numbers)
-    adj = build_adjacency_matrix(pos_R, atomic_numbers)
-    graph_dist = graph_distances_to_core(adj, core)
-    weights = compute_element_aware_weights(
-        graph_dist, atomic_numbers,
-        w_min=w_min, lambda_decay=lambda_decay,
-        normalize=True, custom_alpha=custom_alpha,
+    del pos_R, pos_P, w_min, lambda_decay  # signature-only
+    alpha_dict = custom_alpha if custom_alpha is not None else ELEMENT_IMPORTANCE
+    weights = np.array(
+        [alpha_dict.get(int(z), 1.0) for z in atomic_numbers],
+        dtype=np.float64,
     )
+    if weights.size > 0 and weights.mean() > 1e-8:
+        weights = weights / weights.mean()
     return weights
