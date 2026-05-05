@@ -525,7 +525,7 @@ def main(argv=None):
     trainer_kwargs = dict(
         # max_epochs=3000 for full-dataset runs.
         # Use 300 for quick iteration (DATA_LIMIT=300, ~1h) or 1000 for mid-scale.
-        max_epochs=-1,  # Unlimited; bounded by EarlyStopping (patience=150)
+        max_epochs=int(os.environ.get("MAX_EPOCHS", "-1")),  # -1 = unlimited; EarlyStopping bounds via patience.
         accelerator=accelerator,
         deterministic=False,
         devices=devices,
