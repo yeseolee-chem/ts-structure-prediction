@@ -602,7 +602,7 @@ def main(argv=None):
         # 3000 epochs for full-dataset BCD runs (per markdown spec).
         # Use 1000 for mid-scale (DATA_LIMIT=1000, ~11h on A10) or 300 for
         # quick iteration.
-        max_epochs=-1,  # Unlimited; bounded by EarlyStopping (patience=150)
+        max_epochs=int(os.environ.get("MAX_EPOCHS", "-1")),  # -1 = unlimited; EarlyStopping bounds via patience.
         accelerator=accelerator,
         deterministic=False,
         devices=devices,
