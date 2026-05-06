@@ -91,7 +91,7 @@ def compute_ic_interpolation(
     atomic_numbers: np.ndarray,
     alpha: float = 0.5,
     apply_clash_check: bool = False,
-    max_lbfgs_iter: int = 20,
+    max_lbfgs_iter: int = 5,
     weight_bond: float = 1.0,
     weight_angle: float = 0.5,
     weight_dihedral: float = 0.3,
