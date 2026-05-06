@@ -9,9 +9,18 @@ References:
 - Zimmerman, J. Chem. Theory Comput., 2013, DOI: 10.1021/ct400319w (GSM)
 - vdW radii: Bondi, J. Phys. Chem., 1964, DOI: 10.1021/j100785a001
 """
+import hashlib
 import numpy as np
 from scipy.optimize import minimize
 from typing import Optional
+
+
+# Per-process IC result cache. Keyed by md5(pos_R || pos_P || atomic_numbers ||
+# alpha || max_lbfgs_iter), so equal inputs always return the cached result.
+# Reactions are fixed across epochs, so each unique (R, P) pair triggers L-BFGS
+# exactly once. With limit_train_batches=200 and DATA_LIMIT=2000 this turns
+# ~150 epochs of recomputation into 1 epoch of warmup + cache hits.
+_IC_CACHE: dict = {}
 
 from reactot.utils.internal_coords import (
     get_connectivity, get_angles, get_dihedrals,
@@ -115,6 +124,19 @@ def compute_ic_interpolation(
     Returns:
         x0: (N, 3) interpolated structure
     """
+    # Cache lookup: reactions are fixed across epochs, so the IC result is
+    # deterministic per (R, P, Z, alpha, max_iter). md5 fingerprint keeps the
+    # key footprint small (~32 bytes per entry).
+    _ic_key = hashlib.md5(
+        np.ascontiguousarray(pos_R, dtype=np.float32).tobytes()
+        + np.ascontiguousarray(pos_P, dtype=np.float32).tobytes()
+        + np.ascontiguousarray(atomic_numbers, dtype=np.int64).tobytes()
+        + f"|a={alpha}|m={max_lbfgs_iter}|c={apply_clash_check}".encode()
+    ).digest()
+    _ic_hit = _IC_CACHE.get(_ic_key)
+    if _ic_hit is not None:
+        return _ic_hit.copy()
+
     # 1. 연결 정보 (R 기준; v2: get_dihedrals는 bonds만 받음)
     bonds = get_connectivity(pos_R, atomic_numbers)
     angles = get_angles(bonds)
@@ -150,6 +172,8 @@ def compute_ic_interpolation(
     # 6. Center-of-mass 제거
     x0 -= x0.mean(axis=0)
 
+    # Store in cache (copy to keep cache immutable from caller mutations).
+    _IC_CACHE[_ic_key] = x0.copy()
     return x0
 
 
